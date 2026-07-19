@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Blob Network v3 — Supabase Edition</title>
+<style>
+  html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:transparent;}
+  #root{position:relative;width:100%;height:100%;}
+  svg{position:absolute;inset:0;width:100%;height:100%;display:block;cursor:crosshair;}
+  svg.used{cursor:default;}
+</style>
+
+<!-- ============================================================
+     HUDバーのスタイル（★カスタマイズはこのブロックを編集★）
+     iframe内のため、サイト側CSSからは上書きできません。
+     調整はこのファイルのここを直接編集してください。
+     ============================================================ -->
+<style id="hud-style">
+  @import url('https://fonts.googleapis.com/css2?family=Space+Mono&display=swap');
+  #bar{
+    position:absolute; left:0; right:0; bottom:0;
+    display:flex;
+    padding:10px 40px;              /* PC */
+    justify-content:space-between;
+    align-items:flex-start;
+    align-self:stretch;
+    pointer-events:none;
+    box-sizing:border-box;
+  }
+  @media (max-width:768px){
+    #bar{ padding:10px 20px; }      /* Mobile */
+  }
+  #bar .txt{
+    color:#FFF;
+    background:#000;                /* テキストエリア背景 */
+    font-family:"Space Mono",Consolas,monospace;
+    font-size:10px;
+    font-style:normal;
+    font-weight:400;
+    line-height:normal;
+    letter-spacing:1.8px;
+    padding:3px 6px;
+    white-space:pre;
+  }
+</style>
+</head>
+<body>
+<div id="root">
+  <svg id="svg" xmlns="http://www.w3.org/2000/svg" preserveAspectRatio="xMidYMid slice"></svg>
+  <div id="bar" style="display:none">
+    <div class="txt" id="barL"></div>
+    <div class="txt" id="barR"></div>
+  </div>
+</div>
+<!-- Supabase JS (CDN) — 読み込み失敗してもローカルモードで動作します -->
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script src="./config.js"></script>
+<script>
+"use strict";
+/* ============================================================
+ * BLOB NETWORK v3 — 埋め込みウィジェット本体（Supabase Edition）
+ * 設定は config.js (window.BLOB_CONFIG) 側で行う
+ *
+ * リアルタイム構成:
+ *   ・blob共有        → Supabase Realtime Broadcast (channel.send / on('broadcast'))
+ *   ・Total Marks累計 → global_marks テーブル(id=1) + RPC increment_mark()
+ * 障害時は自動でローカルモードにフォールバックし、アートとして動き続ける。
+ * ============================================================ */
+const CFG=window.BLOB_CONFIG||{};
+const P=Object.assign({
+  w:1200,h:700,bg:'#ffffff',c1:'#d9e92c',c2:'#4fc3e8',useGrad:false,gradAng:45,
+  blur:14,contrast:28,opacity:1,minR:14,maxR:80,speed:50,pulse:0.3,
+  lnOn:true,lnDist:320,lnW:1.5,lnC:'#1c1e22',lnA:0.7,
+  hudMarker:true,hudCoords:true,hudId:true,hudSize:11,hudC:'#1c1e22',
+},CFG.params||{});
+const SEL=Object.assign({bg:'#000000',text:'#ffffff'},CFG.selection||{});
+const MAX=CFG.maxBlobs||40;
+const SVGNS='http://www.w3.org/2000/svg';
+const svg=document.getElementById('svg');
+const bar=document.getElementById('bar'), barL=document.getElementById('barL'), barR=document.getElementById('barR');
+
+/* ---------- client id（自分のblob識別用） ---------- */
+let myId;
+try{
+  myId=localStorage.getItem('blobClientId');
+  if(!myId){myId=(crypto.randomUUID?crypto.randomUUID():'c'+Math.random().toString(36).slice(2));localStorage.setItem('blobClientId',myId)}
+}catch(e){myId='c'+Math.random().toString(36).slice(2)}
+
+/* ---------- SVG scaffold ---------- */
+svg.setAttribute('viewBox',`0 0 ${P.w} ${P.h}`);
+const a=P.gradAng*Math.PI/180;
+svg.innerHTML=
+  `<defs>`
+  +`<filter id="goo" x="-40%" y="-40%" width="180%" height="180%">`
+  +`<feGaussianBlur in="SourceGraphic" stdDeviation="${P.blur}" result="b"/>`
+  +`<feColorMatrix in="b" values="1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 ${P.contrast} ${(-P.contrast*0.38).toFixed(1)}"/>`
+  +`</filter>`
+  +`<linearGradient id="grad" x1="${(50-Math.cos(a)*50).toFixed(1)}%" y1="${(50-Math.sin(a)*50).toFixed(1)}%" x2="${(50+Math.cos(a)*50).toFixed(1)}%" y2="${(50+Math.sin(a)*50).toFixed(1)}%">`
+  +`<stop offset="0%" stop-color="${P.c1}"/><stop offset="100%" stop-color="${P.c2}"/></linearGradient>`
+  +`</defs>`
+  +`<rect width="${P.w}" height="${P.h}" fill="${P.bg}"/>`
+  +`<g id="goog" filter="url(#goo)" fill="${P.useGrad?'url(#grad)':P.c1}" opacity="${P.opacity}"></g>`
+  +`<g id="lineg"></g><g id="hudg"></g>`;
+const gooG=svg.querySelector('#goog'), lineG=svg.querySelector('#lineg'), hudG=svg.querySelector('#hudg');
+
+/* ---------- 決定論的モーション ----------
+ * 位置はblob idと現在時刻(エポック秒)だけで決まる純関数。
+ * → 全ユーザーの画面でblobがほぼ同じ位置に表示される。 */
+function mulberry32(s){return function(){s|=0;s=s+0x6D2B79F5|0;let t=Math.imul(s^s>>>15,1|s);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296}}
+function hashId(id){let h=2166136261;const s=String(id);for(let i=0;i<s.length;i++){h^=s.charCodeAt(i);h=Math.imul(h,16777619)}return h>>>0}
+
+/* ---------- blobs ---------- */
+let blobs=[], total=0, localSeq=0, displaySeq=0;
+const SEED_COUNT=(CFG.seedBlobs||[]).length;
+function makeBlob(rec){ // rec: {id, cid, x(0..1), y(0..1), r(px)}
+  const rng=mulberry32(hashId(rec.id));
+  const b={
+    id:rec.id, cid:rec.cid||null,
+    ax:rec.x*P.w, ay:rec.y*P.h, r0:rec.r,
+    f1:0.10+rng()*0.22, f2:0.05+rng()*0.14, f3:0.08+rng()*0.2,
+    p1:rng()*6.283, p2:rng()*6.283, p3:rng()*6.283, pf:0.5+rng(),
+    x:0,y:0,r:rec.r, own:rec.cid===myId,
+  };
+  b.num=displaySeq++;  // 表示用の連番（内部idの接頭辞は見せない）
+  b.cEl=document.createElementNS(SVGNS,'circle'); gooG.appendChild(b.cEl);
+  b.hEl=document.createElementNS(SVGNS,'g');
+  b.hEl.innerHTML=`<path fill="none"/><circle r="1.6"/><rect rx="1"/><text font-family="Consolas,Menlo,monospace"></text>`;
+  hudG.appendChild(b.hEl);
+  blobs.push(b);
+  while(blobs.length>MAX)removeBlob(blobs[0]);
+  return b;
+}
+function removeBlob(b){b.cEl.remove();b.hEl.remove();blobs.splice(blobs.indexOf(b),1)}
+
+/* seed blobs（全ユーザー共通の固定初期配置） */
+function addSeeds(){(CFG.seedBlobs||[]).forEach((s,i)=>makeBlob({id:'seed'+i,cid:null,x:s.x,y:s.y,r:s.r}))}
+
+/* ---------- 物理（時刻の純関数） ----------
+ * P.speed は「動きの速さ」: 周波数と振幅の両方に効く（50 = 標準） */
+function posAt(b,t){
+  const k=P.speed/25;          // 周波数スケール
+  const A=P.speed*1.2;         // 振幅(px)
+  const T=t*k;
+  let x=b.ax+A*(Math.sin(T*b.f1+b.p1)+0.6*Math.sin(T*b.f3+b.p3));
+  let y=b.ay+A*(Math.cos(T*b.f2+b.p2)+0.6*Math.cos(T*b.f1*1.3+b.p1*1.7));
+  const m=30;
+  b.x=Math.min(Math.max(x,m),P.w-m);
+  b.y=Math.min(Math.max(y,m),P.h-m);
+  b.r=b.r0*(1+P.pulse*0.25*Math.sin(t*b.pf+b.p2));
+}
+
+/* ---------- render ---------- */
+let linePool=[];
+function render(){
+  const t=Date.now()/1000;
+  for(const b of blobs){
+    posAt(b,t);
+    b.cEl.setAttribute('cx',b.x.toFixed(1));
+    b.cEl.setAttribute('cy',b.y.toFixed(1));
+    b.cEl.setAttribute('r',Math.max(b.r,0.1).toFixed(1));
+  }
+  // 接続線（近距離plexus）
+  let li=0;
+  if(P.lnOn){
+    for(let i=0;i<blobs.length;i++)for(let j=i+1;j<blobs.length;j++){
+      const A=blobs[i],B=blobs[j];
+      const d=Math.hypot(A.x-B.x,A.y-B.y);
+      if(d>P.lnDist)continue;
+      let ln=linePool[li];
+      if(!ln){ln=document.createElementNS(SVGNS,'line');linePool.push(ln);lineG.appendChild(ln)}
+      ln.setAttribute('x1',A.x.toFixed(1));ln.setAttribute('y1',A.y.toFixed(1));
+      ln.setAttribute('x2',B.x.toFixed(1));ln.setAttribute('y2',B.y.toFixed(1));
+      ln.setAttribute('stroke',P.lnC);ln.setAttribute('stroke-width',P.lnW);
+      ln.setAttribute('stroke-opacity',(P.lnA*(1-d/P.lnDist)).toFixed(3));
+      ln.style.display='';
+      li++;
+    }
+  }
+  for(let k2=li;k2<linePool.length;k2++)linePool[k2].style.display='none';
+  // トラッキングHUD
+  const s=P.hudSize, cr=Math.max(5,s*0.55);
+  for(const b of blobs){
+    const g=b.hEl;
+    g.setAttribute('transform',`translate(${b.x.toFixed(1)},${b.y.toFixed(1)})`);
+    const [cross,dot,box,lbl]=g.children;
+    if(P.hudMarker){
+      cross.setAttribute('d',`M${-cr} 0H${cr}M0 ${-cr}V${cr}`);
+      cross.setAttribute('stroke',b.own?SEL.bg:P.hudC);cross.setAttribute('stroke-width',b.own?1.5:1);
+      dot.setAttribute('fill',b.own?SEL.bg:P.hudC);
+      cross.style.display='';dot.style.display='';
+    }else{cross.style.display='none';dot.style.display='none'}
+    if(P.hudCoords||P.hudId){
+      const id=P.hudId?('#'+String(b.num).padStart(2,'0')):'';
+      const co=P.hudCoords?` ${Math.round(b.x)},${Math.round(b.y)}`:'';
+      lbl.textContent=(id+co).trim();
+      lbl.setAttribute('x',cr+4);lbl.setAttribute('y',-cr-3);
+      lbl.setAttribute('font-size',s);
+      lbl.style.display='';
+      if(b.own){ // テキスト選択風ハイライト
+        lbl.setAttribute('fill',SEL.text);
+        const w=lbl.getComputedTextLength();
+        box.setAttribute('x',cr+1);box.setAttribute('y',-cr-3-s*0.85);
+        box.setAttribute('width',w+6);box.setAttribute('height',s*1.15);
+        box.setAttribute('fill',SEL.bg);box.style.display='';
+      }else{lbl.setAttribute('fill',P.hudC);box.style.display='none'}
+    }else{lbl.style.display='none';box.style.display='none'}
+  }
+  requestAnimationFrame(render);
+}
+
+/* ---------- HUDバー（左下: カウンター / 右下: キャプション） ----------
+ * Total Marks = ネットワーク全体のマーク総数（シード + 累計クリック数）。
+ * total は初期ロードで global_marks から取得し、以降はローカルで加算。
+ * Supabase障害時は「最後に取得できた値」を起点にローカル加算を継続する。 */
+function updateHud(){
+  if(!CFG.counter)return;
+  bar.style.display='';
+  barL.textContent=(CFG.captionLeft||'Total Marks:')+'\n# '+(SEED_COUNT+total).toLocaleString('en-US');
+  barR.textContent=CFG.captionRight||"Let's click/tap\nto leave your mark";
+}
+
+/* ============================================================
+ * Supabase リアルタイム連携
+ *   live=true  : Broadcast + RPC が使える状態
+ *   live=false : ローカルモード（描画とローカルカウントのみ継続）
+ * すべての失敗は console.warn に留め、画面には一切エラーを出さない。
+ * ============================================================ */
+let sb=null, channel=null, live=false;
+const API_TIMEOUT=4000;
+function withTimeout(p,ms){
+  return Promise.race([p,new Promise((_,rej)=>setTimeout(()=>rej(new Error('timeout')),ms))]);
+}
+function validRec(p){
+  return p&&typeof p.x==='number'&&p.x>=0&&p.x<=1
+    &&typeof p.y==='number'&&p.y>=0&&p.y<=1
+    &&typeof p.r==='number'&&p.r>=1&&p.r<=500
+    &&typeof p.id==='string'&&p.id.length<=80;
+}
+
+function initSupabase(){
+  const su=CFG.supabase||{};
+  const url=(su.projectUrl||'').trim(), key=(su.anonKey||'').trim();
+  if(!url||!key){console.info('[blob] Supabase未設定 → ローカルモードで起動');return}
+  if(!window.supabase||!window.supabase.createClient){
+    console.warn('[blob] supabase-js CDNの読み込みに失敗 → ローカルモード');return}
+  try{
+    sb=window.supabase.createClient(url,key);
+  }catch(e){console.warn('[blob] Supabase初期化失敗 → ローカルモード',e);sb=null;return}
+
+  /* --- 初期ロード: Total Marks を global_marks から取得 --- */
+  withTimeout(
+    sb.from('global_marks').select('count').eq('id',1).single(),
+    API_TIMEOUT
+  ).then(({data,error})=>{
+    if(error)throw error;
+    if(data&&typeof data.count==='number'){
+      total=Math.max(total,data.count); // ロード前のローカルクリックを失わない
+      updateHud();
+    }
+  }).catch(e=>{
+    console.warn('[blob] Total Marks取得失敗 → ローカル値を起点に継続',e&&e.message);
+  });
+
+  /* --- Broadcast: blob生成イベントの共有 --- */
+  const rxLast=new Map(); // 受信側スパム対策（送信者ごとに250ms間隔）
+  try{
+    channel=sb.channel('blob-network',{config:{broadcast:{self:false}}});
+    channel.on('broadcast',{event:'spawn'},msg=>{
+      try{
+        const p=(msg&&msg.payload)||{};
+        if(!validRec(p))return;
+        const now=Date.now(), cid=String(p.cid||'?');
+        if(now-(rxLast.get(cid)||0)<250)return;
+        rxLast.set(cid,now);
+        makeBlob({id:p.id,cid:p.cid,x:p.x,y:p.y,r:p.r});
+        total++;updateHud();
+      }catch(e){console.warn('[blob] broadcast受信処理エラー',e)}
+    });
+    channel.subscribe(status=>{
+      if(status==='SUBSCRIBED'){
+        if(!live)console.info('[blob] Supabase Realtime 接続');
+        live=true;
+      }else if(status==='CHANNEL_ERROR'||status==='TIMED_OUT'||status==='CLOSED'){
+        if(live)console.warn('[blob] Realtime切断 → ローカルモードにフォールバック（自動再接続待ち）');
+        live=false; // supabase-jsが自動再接続し、復帰時にSUBSCRIBEDが再度来る
+      }
+    });
+  }catch(e){console.warn('[blob] Realtimeチャンネル作成失敗 → ローカルモード',e);channel=null;live=false}
+}
+
+/* ---------- クリックでblob追加 ----------
+ * ・clickLimit 回まで（ページ表示ごとにリセット。リロード/再訪問で復活）
+ * ・連打対策: 300msスロットリング（clickLimit=0の無制限運用時の保険）
+ * ・自分のblobは即時ローカル描画（楽観的更新）。live時のみBroadcast+RPC送信 */
+let clicksUsed=0, lastClickAt=0;
+const CLICK_LIMIT=('clickLimit' in CFG)?CFG.clickLimit:1; // 0やnullで無制限
+const THROTTLE_MS=300;
+svg.addEventListener('click',e=>{
+  if(CLICK_LIMIT&&clicksUsed>=CLICK_LIMIT)return;
+  const now=Date.now();
+  if(now-lastClickAt<THROTTLE_MS)return; // 連打対策
+  lastClickAt=now;
+  // slice表示でも正確に論理座標へ変換
+  const pt=svg.createSVGPoint();pt.x=e.clientX;pt.y=e.clientY;
+  const ctm=svg.getScreenCTM();if(!ctm)return;
+  const p=pt.matrixTransform(ctm.inverse());
+  if(p.x<0||p.y<0||p.x>P.w||p.y>P.h)return;
+  const rec={
+    id:'b'+hashId(myId).toString(36)+'-'+now.toString(36)+'-'+(localSeq++),
+    cid:myId,
+    x:+(p.x/P.w).toFixed(4), y:+(p.y/P.h).toFixed(4),
+    r:Math.round(P.minR+Math.random()*(P.maxR-P.minR)),
+  };
+  clicksUsed++;
+  if(CLICK_LIMIT&&clicksUsed>=CLICK_LIMIT)svg.classList.add('used');
+  // 1) 即時ローカル反映（Supabaseの成否に関わらずアートは動き続ける）
+  makeBlob(rec);
+  total++;updateHud();
+  // 2) live時のみネットワークへ
+  if(live&&channel){
+    try{
+      Promise.resolve(channel.send({type:'broadcast',event:'spawn',payload:rec}))
+        .then(res=>{if(res!=='ok')console.warn('[blob] broadcast送信失敗:',res)})
+        .catch(e=>console.warn('[blob] broadcast送信エラー',e));
+    }catch(e){console.warn('[blob] broadcast送信例外',e)}
+  }
+  if(sb){
+    withTimeout(sb.rpc('increment_mark'),API_TIMEOUT).then(({data,error})=>{
+      if(error)throw error;
+      // RPCが新しい累計を返す場合はサーバー値に補正（返さない実装でもOK）
+      if(typeof data==='number'&&isFinite(data)){total=Math.max(total,data);updateHud()}
+    }).catch(e=>{
+      console.warn('[blob] increment_mark失敗 → ローカルカウントで継続',e&&e.message);
+    });
+  }
+});
+
+/* ---------- init ---------- */
+addSeeds();
+updateHud();
+initSupabase();
+requestAnimationFrame(render);
+</script>
+</body>
+</html>
