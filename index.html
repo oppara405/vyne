@@ -80,7 +80,7 @@ const SEL=Object.assign({bg:'#000000',text:'#ffffff'},CFG.selection||{});
 /* ---- モバイル軽量モード（自動判定） ----
  * SVGフィルターはモバイルで重いため、ブラー弱め・30fps・blob数控えめで動かす */
 const IS_MOBILE=(window.matchMedia&&matchMedia('(pointer:coarse)').matches)||/iPhone|iPad|Android/i.test(navigator.userAgent);
-const PERF=Object.assign({mobileFps:30,mobileBlurScale:0.7,mobileMaxBlobs:25},CFG.perf||{});
+const PERF=Object.assign({mobileFps:30,mobileBlurScale:0.5,mobileMaxBlobs:20},CFG.perf||{});
 const HARD_CAP=50; // 表示上限（接続線がO(n^2)のためパフォーマンス保護）
 const MAX=Math.min(CFG.maxBlobs||40,HARD_CAP,IS_MOBILE?PERF.mobileMaxBlobs:HARD_CAP);
 const SVGNS='http://www.w3.org/2000/svg';
