@@ -20,9 +20,9 @@ window.BLOB_CONFIG = {
 
   /* ---- モバイル軽量モード（自動適用。必要なら調整） ---- */
   perf: {
-    mobileFps: 30,        // モバイルのフレームレート上限
-    mobileBlurScale: 0.7, // モバイルでのブラー弱体化（0.5〜1）
-    mobileMaxBlobs: 25,   // モバイルでの表示blob上限
+    mobileFps: 24,        // モバイルのフレームレート上限
+    mobileBlurScale: 0.5, // モバイルでのブラー弱体化（0.5〜1）
+    mobileMaxBlobs: 15,   // モバイルでの表示blob上限
   },
 
   /* ---- 自分のblobのハイライト（テキスト選択風） ---- */
