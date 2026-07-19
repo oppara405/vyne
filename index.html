@@ -65,6 +65,7 @@
  * リアルタイム構成:
  *   ・blob共有        → Supabase Realtime Broadcast (channel.send / on('broadcast'))
  *   ・Total Marks累計 → global_marks テーブル(id=1) + RPC increment_mark()
+ * 初期表示は Total Marks 分のblob（上限 min(maxBlobs, 50)）。
  * 障害時は自動でローカルモードにフォールバックし、アートとして動き続ける。
  * ============================================================ */
 const CFG=window.BLOB_CONFIG||{};
@@ -75,7 +76,8 @@ const P=Object.assign({
   hudMarker:true,hudCoords:true,hudId:true,hudSize:11,hudC:'#1c1e22',
 },CFG.params||{});
 const SEL=Object.assign({bg:'#000000',text:'#ffffff'},CFG.selection||{});
-const MAX=CFG.maxBlobs||40;
+const HARD_CAP=50; // 表示上限（接続線がO(n^2)のためパフォーマンス保護）
+const MAX=Math.min(CFG.maxBlobs||40,HARD_CAP);
 const SVGNS='http://www.w3.org/2000/svg';
 const svg=document.getElementById('svg');
 const bar=document.getElementById('bar'), barL=document.getElementById('barL'), barR=document.getElementById('barR');
@@ -112,7 +114,6 @@ function hashId(id){let h=2166136261;const s=String(id);for(let i=0;i<s.length;i
 
 /* ---------- blobs ---------- */
 let blobs=[], total=0, localSeq=0, displaySeq=0;
-const SEED_COUNT=(CFG.seedBlobs||[]).length;
 function makeBlob(rec){ // rec: {id, cid, x(0..1), y(0..1), r(px)}
   const rng=mulberry32(hashId(rec.id));
   const b={
@@ -123,6 +124,7 @@ function makeBlob(rec){ // rec: {id, cid, x(0..1), y(0..1), r(px)}
     x:0,y:0,r:rec.r, own:rec.cid===myId,
   };
   b.num=displaySeq++;  // 表示用の連番（内部idの接頭辞は見せない）
+  b.rec=rec;           // 再構築時の復元用
   b.cEl=document.createElementNS(SVGNS,'circle'); gooG.appendChild(b.cEl);
   b.hEl=document.createElementNS(SVGNS,'g');
   b.hEl.innerHTML=`<path fill="none"/><circle r="1.6"/><rect rx="1"/><text font-family="Consolas,Menlo,monospace"></text>`;
@@ -132,9 +134,31 @@ function makeBlob(rec){ // rec: {id, cid, x(0..1), y(0..1), r(px)}
   return b;
 }
 function removeBlob(b){b.cEl.remove();b.hEl.remove();blobs.splice(blobs.indexOf(b),1)}
+function clearBlobs(){while(blobs.length)removeBlob(blobs[0]);displaySeq=0}
 
-/* seed blobs（全ユーザー共通の固定初期配置） */
+/* seed blobs（Supabase未接続時・Total Marks=0のときのフォールバック表示） */
 function addSeeds(){(CFG.seedBlobs||[]).forEach((s,i)=>makeBlob({id:'seed'+i,cid:null,x:s.x,y:s.y,r:s.r}))}
+
+/* Total Marks分の初期blobを生成
+ * ・表示数 = min(Total Marks, maxBlobs, 50)
+ * ・配置/サイズはインデックスから決定論的に生成 → 全ユーザーの画面で同一
+ * ・以降の新規クリックは最古のblobを押し出す（makeBlob内のMAXキャップ）
+ * ・自分がクリック済みのblobは消さずに引き継ぐ */
+function renderMarks(n){
+  const count=Math.min(n,MAX);
+  if(count<=0)return; // 0件のときはシード表示のまま
+  const own=blobs.filter(b=>b.own).map(b=>b.rec);
+  clearBlobs();
+  for(let i=0;i<count;i++){
+    const k=n-count+i; // 「最新n件」に相当するインデックス（totalの増加とともに景色が変わる）
+    const rng=mulberry32(hashId('mark'+k));
+    makeBlob({id:'mark'+k,cid:null,
+      x:+(0.08+rng()*0.84).toFixed(4),
+      y:+(0.08+rng()*0.84).toFixed(4),
+      r:Math.round(P.minR+(P.maxR-P.minR)*rng())});
+  }
+  own.forEach(rec=>makeBlob(rec));
+}
 
 /* ---------- 物理（時刻の純関数） ----------
  * P.speed は「動きの速さ」: 周波数と振幅の両方に効く（50 = 標準） */
@@ -210,13 +234,13 @@ function render(){
 }
 
 /* ---------- HUDバー（左下: カウンター / 右下: キャプション） ----------
- * Total Marks = ネットワーク全体のマーク総数（シード + 累計クリック数）。
+ * Total Marks = 累計クリック数の実数（表示blob数が上限で頭打ちでも数字は増え続ける）。
  * total は初期ロードで global_marks から取得し、以降はローカルで加算。
  * Supabase障害時は「最後に取得できた値」を起点にローカル加算を継続する。 */
 function updateHud(){
   if(!CFG.counter)return;
   bar.style.display='';
-  barL.textContent=(CFG.captionLeft||'Total Marks:')+'\n# '+(SEED_COUNT+total).toLocaleString('en-US');
+  barL.textContent=(CFG.captionLeft||'Total Marks:')+'\n# '+total.toLocaleString('en-US');
   barR.textContent=CFG.captionRight||"Let's click/tap\nto leave your mark";
 }
 
@@ -248,7 +272,7 @@ function initSupabase(){
     sb=window.supabase.createClient(url,key);
   }catch(e){console.warn('[blob] Supabase初期化失敗 → ローカルモード',e);sb=null;return}
 
-  /* --- 初期ロード: Total Marks を global_marks から取得 --- */
+  /* --- 初期ロード: Total Marks を global_marks から取得し、その数分のblobを表示 --- */
   withTimeout(
     sb.from('global_marks').select('count').eq('id',1).single(),
     API_TIMEOUT
@@ -256,6 +280,7 @@ function initSupabase(){
     if(error)throw error;
     if(data&&typeof data.count==='number'){
       total=Math.max(total,data.count); // ロード前のローカルクリックを失わない
+      renderMarks(total);               // Total Marks分の初期blobを表示
       updateHud();
     }
   }).catch(e=>{
