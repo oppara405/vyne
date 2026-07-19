@@ -3,19 +3,18 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Blob Network v3 — Supabase Edition</title>
+<title>Blob Network v4 — WebGL Edition</title>
 <style>
   html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:transparent;}
   #root{position:relative;width:100%;height:100%;}
-  svg{position:absolute;inset:0;width:100%;height:100%;display:block;cursor:crosshair;
-    transform:translateZ(0); will-change:transform;} /* GPUレイヤー化: iOS Safariの描画残り対策 */
+  #goo{position:absolute;inset:0;width:100%;height:100%;display:block;}
+  svg{position:absolute;inset:0;width:100%;height:100%;display:block;cursor:crosshair;}
   svg.used{cursor:default;}
 </style>
 
 <!-- ============================================================
      HUDバーのスタイル（★カスタマイズはこのブロックを編集★）
      iframe内のため、サイト側CSSからは上書きできません。
-     調整はこのファイルのここを直接編集してください。
      ============================================================ -->
 <style id="hud-style">
   @import url('https://fonts.googleapis.com/css2?family=Space+Mono&display=swap');
@@ -48,7 +47,8 @@
 </head>
 <body>
 <div id="root">
-  <svg id="svg" xmlns="http://www.w3.org/2000/svg" preserveAspectRatio="xMidYMid slice"></svg>
+  <canvas id="goo"></canvas><!-- グーイ描画: WebGL(GPU) -->
+  <svg id="svg" xmlns="http://www.w3.org/2000/svg" preserveAspectRatio="xMidYMid slice"></svg><!-- 線+HUD: フィルター無しSVG(軽量) -->
   <div id="bar" style="display:none">
     <div class="txt" id="barL"></div>
     <div class="txt" id="barR"></div>
@@ -60,14 +60,15 @@
 <script>
 "use strict";
 /* ============================================================
- * BLOB NETWORK v3 — 埋め込みウィジェット本体（Supabase Edition）
- * 設定は config.js (window.BLOB_CONFIG) 側で行う
+ * BLOB NETWORK v4 — 埋め込みウィジェット本体（WebGL Edition）
  *
- * リアルタイム構成:
- *   ・blob共有        → Supabase Realtime Broadcast (channel.send / on('broadcast'))
- *   ・Total Marks累計 → global_marks テーブル(id=1) + RPC increment_mark()
- * 初期表示は Total Marks 分のblob（上限 min(maxBlobs, 50)）。
- * 障害時は自動でローカルモードにフォールバックし、アートとして動き続ける。
+ * v3からの変更点:
+ *   ・グーイ描画を SVGフィルター(CPU) → WebGLシェーダー(GPU) に移行
+ *     - メタボール場をフラグメントシェーダーで計算（feGaussianBlur廃止）
+ *     - 端末解像度に依存しない安定した負荷。描画残り（ゴースト）も構造的に解消
+ *   ・接続線・座標HUDはフィルター無しSVGオーバーレイ（軽量）のまま
+ *   ・タップ位置補正: 出現時の揺らぎオフセットを逆算し、タップ地点に正確に出現
+ *   ・WebGL非対応環境ではSVG円描画（グーイ無し）に自動フォールバック
  * ============================================================ */
 const CFG=window.BLOB_CONFIG||{};
 const P=Object.assign({
@@ -77,48 +78,133 @@ const P=Object.assign({
   hudMarker:true,hudCoords:true,hudId:true,hudSize:11,hudC:'#1c1e22',
 },CFG.params||{});
 const SEL=Object.assign({bg:'#000000',text:'#ffffff'},CFG.selection||{});
-/* ---- モバイル軽量モード（自動判定） ----
- * SVGフィルターはモバイルで重いため、ブラー弱め・30fps・blob数控えめで動かす */
 const IS_MOBILE=(window.matchMedia&&matchMedia('(pointer:coarse)').matches)||/iPhone|iPad|Android/i.test(navigator.userAgent);
-const PERF=Object.assign({mobileFps:30,mobileBlurScale:0.5,mobileMaxBlobs:20},CFG.perf||{});
-const HARD_CAP=50; // 表示上限（接続線がO(n^2)のためパフォーマンス保護）
+const PERF=Object.assign({mobileFps:60,mobileBlurScale:1,mobileMaxBlobs:50},CFG.perf||{});
+const HARD_CAP=50;
 const MAX=Math.min(CFG.maxBlobs||40,HARD_CAP,IS_MOBILE?PERF.mobileMaxBlobs:HARD_CAP);
 const SVGNS='http://www.w3.org/2000/svg';
 const svg=document.getElementById('svg');
 const bar=document.getElementById('bar'), barL=document.getElementById('barL'), barR=document.getElementById('barR');
 
-/* ---------- client id（自分のblob識別用） ---------- */
+/* ---------- client id ---------- */
 let myId;
 try{
   myId=localStorage.getItem('blobClientId');
   if(!myId){myId=(crypto.randomUUID?crypto.randomUUID():'c'+Math.random().toString(36).slice(2));localStorage.setItem('blobClientId',myId)}
 }catch(e){myId='c'+Math.random().toString(36).slice(2)}
 
-/* ---------- SVG scaffold ---------- */
+/* ============================================================
+ * WebGL レンダラー（グーイ本体・GPU実行）
+ * メタボール: field = Σ r²/d² を全ピクセルで計算し、しきい値で輪郭化
+ * ============================================================ */
+const canvas=document.getElementById('goo');
+let gl=null,glProg=null,glU={},HAS_GL=false;
+const DPR=Math.min(window.devicePixelRatio||1,2);
+const MERGE_K=1+P.blur/40;                                  // blur → 融合の強さ
+const SOFT=Math.min(Math.max(8/P.contrast,0.04),0.6);       // contrast → エッジの柔らかさ
+function hex2rgb(h){const n=parseInt(h.slice(1),16);return[(n>>16&255)/255,(n>>8&255)/255,(n&255)/255]}
+
+function initGL(){
+  try{
+    gl=canvas.getContext('webgl',{antialias:false,alpha:false,depth:false,stencil:false,preserveDrawingBuffer:false})
+      ||canvas.getContext('experimental-webgl');
+  }catch(e){gl=null}
+  if(!gl){console.warn('[blob] WebGL利用不可 → SVGフォールバック描画');return false}
+  const vs=`attribute vec2 aP;void main(){gl_Position=vec4(aP,0.,1.);}`;
+  const fs=`#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
+precision mediump float;
+#endif
+uniform vec2 uRes,uOffset,uSizeL,uGradDir;
+uniform float uScale,uSoft,uMergeK,uOpacity;
+uniform int uCount;
+uniform vec3 uBlobs[${HARD_CAP}];
+uniform vec3 uC1,uC2,uBg;
+void main(){
+  vec2 frag=vec2(gl_FragCoord.x,uRes.y-gl_FragCoord.y);
+  vec2 l=(frag-uOffset)/uScale;              /* 論理座標(1200x700系)へ変換 */
+  float f=0.0;
+  for(int i=0;i<${HARD_CAP};i++){
+    if(i>=uCount)break;
+    vec2 d=l-uBlobs[i].xy;
+    float r=uBlobs[i].z*uMergeK;
+    f+=r*r/max(dot(d,d),1.0);
+  }
+  float a=smoothstep(1.0-uSoft,1.0+uSoft,f)*uOpacity;
+  float gt=clamp(dot(l/uSizeL-vec2(0.5),uGradDir)+0.5,0.0,1.0);
+  vec3 col=mix(uBg,mix(uC1,uC2,gt),a);
+  gl_FragColor=vec4(col,1.0);
+}`;
+  function sh(type,src){const s=gl.createShader(type);gl.shaderSource(s,src);gl.compileShader(s);
+    if(!gl.getShaderParameter(s,gl.COMPILE_STATUS)){console.warn('[blob] shader error:',gl.getShaderInfoLog(s));return null}return s}
+  const v=sh(gl.VERTEX_SHADER,vs),f=sh(gl.FRAGMENT_SHADER,fs);
+  if(!v||!f)return false;
+  glProg=gl.createProgram();gl.attachShader(glProg,v);gl.attachShader(glProg,f);gl.linkProgram(glProg);
+  if(!gl.getProgramParameter(glProg,gl.LINK_STATUS)){console.warn('[blob] link error:',gl.getProgramInfoLog(glProg));return false}
+  gl.useProgram(glProg);
+  const buf=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,buf);
+  gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,3,-1,-1,3]),gl.STATIC_DRAW);
+  const aP=gl.getAttribLocation(glProg,'aP');gl.enableVertexAttribArray(aP);gl.vertexAttribPointer(aP,2,gl.FLOAT,false,0,0);
+  ['uRes','uOffset','uSizeL','uGradDir','uScale','uSoft','uMergeK','uOpacity','uCount','uBlobs','uC1','uC2','uBg']
+    .forEach(n=>glU[n]=gl.getUniformLocation(glProg,n));
+  // 固定uniform
+  const ga=P.gradAng*Math.PI/180;
+  gl.uniform2f(glU.uSizeL,P.w,P.h);
+  gl.uniform2f(glU.uGradDir,Math.cos(ga),Math.sin(ga));
+  gl.uniform1f(glU.uSoft,SOFT);
+  gl.uniform1f(glU.uMergeK,MERGE_K);
+  gl.uniform1f(glU.uOpacity,P.opacity);
+  gl.uniform3fv(glU.uC1,hex2rgb(P.useGrad?P.c1:P.c1));
+  gl.uniform3fv(glU.uC2,hex2rgb(P.useGrad?P.c2:P.c1)); // 単色時はc1=c2
+  gl.uniform3fv(glU.uBg,hex2rgb(P.bg));
+  return true;
+}
+let vpScale=1,vpOffX=0,vpOffY=0;
+function resizeGL(){
+  const cw=canvas.clientWidth,ch=canvas.clientHeight;
+  if(!cw||!ch)return;
+  canvas.width=Math.round(cw*DPR);canvas.height=Math.round(ch*DPR);
+  // preserveAspectRatio: slice と同じマッピング
+  const s=Math.max(cw/P.w,ch/P.h);
+  vpScale=s*DPR;
+  vpOffX=(cw-P.w*s)/2*DPR;
+  vpOffY=(ch-P.h*s)/2*DPR;
+  if(gl){
+    gl.viewport(0,0,canvas.width,canvas.height);
+    gl.uniform2f(glU.uRes,canvas.width,canvas.height);
+    gl.uniform2f(glU.uOffset,vpOffX,vpOffY);
+    gl.uniform1f(glU.uScale,vpScale);
+  }
+}
+const blobArr=new Float32Array(HARD_CAP*3);
+function drawGL(){
+  for(let i=0;i<blobs.length;i++){
+    const b=blobs[i];
+    blobArr[i*3]=b.x;blobArr[i*3+1]=b.y;blobArr[i*3+2]=b.r;
+  }
+  gl.uniform1i(glU.uCount,blobs.length);
+  gl.uniform3fv(glU.uBlobs,blobArr);
+  gl.drawArrays(gl.TRIANGLES,0,3);
+}
+
+/* ---------- SVG scaffold（線+HUDのみ。フィルター不使用） ---------- */
 svg.setAttribute('viewBox',`0 0 ${P.w} ${P.h}`);
-const BLUR=IS_MOBILE?Math.max(4,Math.round(P.blur*PERF.mobileBlurScale)):P.blur;
-const FRO=IS_MOBILE?'-25%':'-40%', FRS=IS_MOBILE?'150%':'180%'; // フィルター領域（狭いほど軽い）
-const a=P.gradAng*Math.PI/180;
+HAS_GL=initGL();
+console.info('[blob] renderer:',HAS_GL?'WebGL (GPU)':'SVG fallback');
 svg.innerHTML=
-  `<defs>`
-  +`<filter id="goo" x="${FRO}" y="${FRO}" width="${FRS}" height="${FRS}">`
-  +`<feGaussianBlur in="SourceGraphic" stdDeviation="${BLUR}" result="b"/>`
-  +`<feColorMatrix in="b" values="1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 ${P.contrast} ${(-P.contrast*0.38).toFixed(1)}"/>`
-  +`</filter>`
-  +`<linearGradient id="grad" x1="${(50-Math.cos(a)*50).toFixed(1)}%" y1="${(50-Math.sin(a)*50).toFixed(1)}%" x2="${(50+Math.cos(a)*50).toFixed(1)}%" y2="${(50+Math.sin(a)*50).toFixed(1)}%">`
-  +`<stop offset="0%" stop-color="${P.c1}"/><stop offset="100%" stop-color="${P.c2}"/></linearGradient>`
-  +`</defs>`
-  +`<rect width="${P.w}" height="${P.h}" fill="${P.bg}"/>`
-  +`<g id="goog" filter="url(#goo)" fill="${P.useGrad?'url(#grad)':P.c1}" opacity="${P.opacity}"></g>`
+  (HAS_GL?'':`<rect width="${P.w}" height="${P.h}" fill="${P.bg}"/>`
+    +`<defs><linearGradient id="grad" x1="0%" y1="0%" x2="100%" y2="0%">`
+    +`<stop offset="0%" stop-color="${P.c1}"/><stop offset="100%" stop-color="${P.useGrad?P.c2:P.c1}"/></linearGradient></defs>`
+    +`<g id="goog" fill="${P.useGrad?'url(#grad)':P.c1}" opacity="${P.opacity}"></g>`)
   +`<g id="lineg"></g><g id="hudg"></g>`;
 const gooG=svg.querySelector('#goog'), lineG=svg.querySelector('#lineg'), hudG=svg.querySelector('#hudg');
+resizeGL();
+window.addEventListener('resize',resizeGL);
 
-/* ---------- 決定論的モーション ----------
- * 位置はblob idと現在時刻(エポック秒)だけで決まる純関数。
- * → 全ユーザーの画面でblobがほぼ同じ位置に表示される。 */
+/* ---------- 決定論的モーション ---------- */
 function mulberry32(s){return function(){s|=0;s=s+0x6D2B79F5|0;let t=Math.imul(s^s>>>15,1|s);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296}}
 function hashId(id){let h=2166136261;const s=String(id);for(let i=0;i<s.length;i++){h^=s.charCodeAt(i);h=Math.imul(h,16777619)}return h>>>0}
-
 /* ---------- blobs ---------- */
 let blobs=[], total=0, localSeq=0, displaySeq=0;
 function makeBlob(rec){ // rec: {id, cid, x(0..1), y(0..1), r(px)}
@@ -130,9 +216,9 @@ function makeBlob(rec){ // rec: {id, cid, x(0..1), y(0..1), r(px)}
     p1:rng()*6.283, p2:rng()*6.283, p3:rng()*6.283, pf:0.5+rng(),
     x:0,y:0,r:rec.r, own:rec.cid===myId,
   };
-  b.num=displaySeq++;  // 表示用の連番（内部idの接頭辞は見せない）
-  b.rec=rec;           // 再構築時の復元用
-  b.cEl=document.createElementNS(SVGNS,'circle'); gooG.appendChild(b.cEl);
+  b.num=displaySeq++;
+  b.rec=rec;
+  if(!HAS_GL){b.cEl=document.createElementNS(SVGNS,'circle');gooG.appendChild(b.cEl)}
   b.hEl=document.createElementNS(SVGNS,'g');
   b.hEl.innerHTML=`<path fill="none"/><circle r="1.6"/><rect rx="1"/><text font-family="Consolas,Menlo,monospace"></text>`;
   hudG.appendChild(b.hEl);
@@ -140,26 +226,29 @@ function makeBlob(rec){ // rec: {id, cid, x(0..1), y(0..1), r(px)}
   while(blobs.length>MAX)removeBlob(blobs[0]);
   return b;
 }
-function removeBlob(b){b.cEl.remove();b.hEl.remove();blobs.splice(blobs.indexOf(b),1)}
+function removeBlob(b){if(b.cEl)b.cEl.remove();b.hEl.remove();blobs.splice(blobs.indexOf(b),1)}
 function clearBlobs(){while(blobs.length)removeBlob(blobs[0]);displaySeq=0}
+
+/* 揺らぎオフセット（posAtと同一式）。タップ位置補正に使用 */
+function driftAt(b,t){
+  const k=P.speed/25,A=P.speed*1.2,T=t*k;
+  return [A*(Math.sin(T*b.f1+b.p1)+0.6*Math.sin(T*b.f3+b.p3)),
+          A*(Math.cos(T*b.f2+b.p2)+0.6*Math.cos(T*b.f1*1.3+b.p1*1.7))];
+}
 
 /* seed blobs（Supabase未接続時・Total Marks=0のときのフォールバック表示） */
 function addSeeds(){(CFG.seedBlobs||[]).forEach((s,i)=>makeBlob({id:'seed'+i,cid:null,x:s.x,y:s.y,r:s.r}))}
 
-/* Total Marks分の初期blobを生成
- * ・表示数 = min(Total Marks, maxBlobs, 50)
- * ・配置/サイズはインデックスから決定論的に生成 → 全ユーザーの画面で同一
- * ・以降の新規クリックは最古のblobを押し出す（makeBlob内のMAXキャップ）
- * ・自分がクリック済みのblobは消さずに引き継ぐ */
-let marksRendered=false; // 初期blobの描画が済んだか（RPC経由のバックフィル判定用）
+/* Total Marks分の初期blobを生成（表示上限 min(maxBlobs,50)） */
+let marksRendered=false;
 function renderMarks(n){
   const count=Math.min(Number(n)||0,MAX);
-  if(count<=0)return; // 0件のときはシード表示のまま
+  if(count<=0)return;
   marksRendered=true;
   const own=blobs.filter(b=>b.own).map(b=>b.rec);
   clearBlobs();
   for(let i=0;i<count;i++){
-    const k=n-count+i; // 「最新n件」に相当するインデックス（totalの増加とともに景色が変わる）
+    const k=n-count+i;
     const rng=mulberry32(hashId('mark'+k));
     makeBlob({id:'mark'+k,cid:null,
       x:+(0.08+rng()*0.84).toFixed(4),
@@ -169,35 +258,31 @@ function renderMarks(n){
   own.forEach(rec=>makeBlob(rec));
 }
 
-/* ---------- 物理（時刻の純関数） ----------
- * P.speed は「動きの速さ」: 周波数と振幅の両方に効く（50 = 標準） */
+/* ---------- 物理（時刻の純関数） ---------- */
 function posAt(b,t){
-  const k=P.speed/25;          // 周波数スケール
-  const A=P.speed*1.2;         // 振幅(px)
-  const T=t*k;
-  let x=b.ax+A*(Math.sin(T*b.f1+b.p1)+0.6*Math.sin(T*b.f3+b.p3));
-  let y=b.ay+A*(Math.cos(T*b.f2+b.p2)+0.6*Math.cos(T*b.f1*1.3+b.p1*1.7));
+  const d=driftAt(b,t);
   const m=30;
-  b.x=Math.min(Math.max(x,m),P.w-m);
-  b.y=Math.min(Math.max(y,m),P.h-m);
+  b.x=Math.min(Math.max(b.ax+d[0],m),P.w-m);
+  b.y=Math.min(Math.max(b.ay+d[1],m),P.h-m);
   b.r=b.r0*(1+P.pulse*0.25*Math.sin(t*b.pf+b.p2));
 }
 
 /* ---------- render ---------- */
 let linePool=[];
 let lastFrame=0;
-const FRAME_MS=IS_MOBILE?Math.floor(1000/Math.max(PERF.mobileFps,10)):0; // モバイルはfps制限
-const FIX=IS_MOBILE?0:1; // モバイルは整数座標（再描画領域を減らす）
+const FRAME_MS=IS_MOBILE&&PERF.mobileFps<60?Math.floor(1000/Math.max(PERF.mobileFps,10)):0;
 function render(now){
   requestAnimationFrame(render);
   if(FRAME_MS&&now-lastFrame<FRAME_MS)return;
   lastFrame=now;
   const t=Date.now()/1000;
-  for(const b of blobs){
-    posAt(b,t);
-    b.cEl.setAttribute('cx',b.x.toFixed(FIX));
-    b.cEl.setAttribute('cy',b.y.toFixed(FIX));
-    b.cEl.setAttribute('r',Math.max(b.r,0.1).toFixed(FIX));
+  for(const b of blobs)posAt(b,t);
+  // グーイ本体
+  if(HAS_GL)drawGL();
+  else for(const b of blobs){
+    b.cEl.setAttribute('cx',b.x.toFixed(1));
+    b.cEl.setAttribute('cy',b.y.toFixed(1));
+    b.cEl.setAttribute('r',Math.max(b.r,0.1).toFixed(1));
   }
   // 接続線（近距離plexus）
   let li=0;
@@ -208,8 +293,8 @@ function render(now){
       if(d>P.lnDist)continue;
       let ln=linePool[li];
       if(!ln){ln=document.createElementNS(SVGNS,'line');linePool.push(ln);lineG.appendChild(ln)}
-      ln.setAttribute('x1',A.x.toFixed(FIX));ln.setAttribute('y1',A.y.toFixed(FIX));
-      ln.setAttribute('x2',B.x.toFixed(FIX));ln.setAttribute('y2',B.y.toFixed(FIX));
+      ln.setAttribute('x1',A.x.toFixed(1));ln.setAttribute('y1',A.y.toFixed(1));
+      ln.setAttribute('x2',B.x.toFixed(1));ln.setAttribute('y2',B.y.toFixed(1));
       ln.setAttribute('stroke',P.lnC);ln.setAttribute('stroke-width',P.lnW);
       ln.setAttribute('stroke-opacity',(P.lnA*(1-d/P.lnDist)).toFixed(3));
       ln.style.display='';
@@ -236,7 +321,7 @@ function render(now){
       lbl.setAttribute('x',cr+4);lbl.setAttribute('y',-cr-3);
       lbl.setAttribute('font-size',s);
       lbl.style.display='';
-      if(b.own){ // テキスト選択風ハイライト
+      if(b.own){
         lbl.setAttribute('fill',SEL.text);
         const w=lbl.getComputedTextLength();
         box.setAttribute('x',cr+1);box.setAttribute('y',-cr-3-s*0.85);
@@ -247,11 +332,8 @@ function render(now){
   }
 }
 
-/* ---------- HUDバー（左下: カウンター / 右下: キャプション） ----------
- * Total Marks = 累計クリック数の実数（表示blob数が上限で頭打ちでも数字は増え続ける）。
- * total は初期ロードで global_marks から取得し、以降はローカルで加算。
- * Supabase障害時は「最後に取得できた値」を起点にローカル加算を継続する。 */
-const COUNT_OFFSET=('countOffset' in CFG)?CFG.countOffset:-1; // 表示は#00起点に合わせて-1
+/* ---------- HUDバー ---------- */
+const COUNT_OFFSET=('countOffset' in CFG)?CFG.countOffset:-1;
 function updateHud(){
   if(!CFG.counter)return;
   bar.style.display='';
@@ -260,10 +342,7 @@ function updateHud(){
 }
 
 /* ============================================================
- * Supabase リアルタイム連携
- *   live=true  : Broadcast + RPC が使える状態
- *   live=false : ローカルモード（描画とローカルカウントのみ継続）
- * すべての失敗は console.warn に留め、画面には一切エラーを出さない。
+ * Supabase リアルタイム連携（v3から変更なし）
  * ============================================================ */
 let sb=null, channel=null, live=false;
 const API_TIMEOUT=4000;
@@ -287,9 +366,6 @@ function initSupabase(){
     sb=window.supabase.createClient(url,key);
   }catch(e){console.warn('[blob] Supabase初期化失敗 → ローカルモード',e);sb=null;return}
 
-  /* --- 初期ロード: Total Marks を global_marks から取得し、その数分のblobを表示 ---
-   * 注意: select('count') は PostgREST が count を集計関数と解釈して失敗することが
-   * あるため、select('*') で行ごと取得して count 列を読む */
   withTimeout(
     sb.from('global_marks').select('*').eq('id',1).single(),
     API_TIMEOUT
@@ -297,8 +373,8 @@ function initSupabase(){
     if(error)throw error;
     const c=Number(data&&data.count);
     if(isFinite(c)&&c>=0){
-      total=Math.max(total,c); // ロード前のローカルクリックを失わない
-      renderMarks(total);      // Total Marks分の初期blobを表示
+      total=Math.max(total,c);
+      renderMarks(total);
       updateHud();
     }else{
       console.warn('[blob] global_marksの応答にcount列が見つかりません:',data);
@@ -307,8 +383,7 @@ function initSupabase(){
     console.warn('[blob] Total Marks取得失敗 → ローカル値を起点に継続',e&&e.message);
   });
 
-  /* --- Broadcast: blob生成イベントの共有 --- */
-  const rxLast=new Map(); // 受信側スパム対策（送信者ごとに250ms間隔）
+  const rxLast=new Map();
   try{
     channel=sb.channel('blob-network',{config:{broadcast:{self:false}}});
     channel.on('broadcast',{event:'spawn'},msg=>{
@@ -328,41 +403,49 @@ function initSupabase(){
         live=true;
       }else if(status==='CHANNEL_ERROR'||status==='TIMED_OUT'||status==='CLOSED'){
         if(live)console.warn('[blob] Realtime切断 → ローカルモードにフォールバック（自動再接続待ち）');
-        live=false; // supabase-jsが自動再接続し、復帰時にSUBSCRIBEDが再度来る
+        live=false;
       }
     });
   }catch(e){console.warn('[blob] Realtimeチャンネル作成失敗 → ローカルモード',e);channel=null;live=false}
 }
 
-/* ---------- クリックでblob追加 ----------
- * ・clickLimit 回まで（ページ表示ごとにリセット。リロード/再訪問で復活）
- * ・連打対策: 300msスロットリング（clickLimit=0の無制限運用時の保険）
- * ・自分のblobは即時ローカル描画（楽観的更新）。live時のみBroadcast+RPC送信 */
+/* ---------- クリックでblob追加 ---------- */
 let clicksUsed=0, lastClickAt=0;
-const CLICK_LIMIT=('clickLimit' in CFG)?CFG.clickLimit:1; // 0やnullで無制限
+const CLICK_LIMIT=('clickLimit' in CFG)?CFG.clickLimit:1;
 const THROTTLE_MS=300;
 svg.addEventListener('click',e=>{
   if(CLICK_LIMIT&&clicksUsed>=CLICK_LIMIT)return;
   const now=Date.now();
-  if(now-lastClickAt<THROTTLE_MS)return; // 連打対策
+  if(now-lastClickAt<THROTTLE_MS)return;
   lastClickAt=now;
-  // slice表示でも正確に論理座標へ変換
   const pt=svg.createSVGPoint();pt.x=e.clientX;pt.y=e.clientY;
   const ctm=svg.getScreenCTM();if(!ctm)return;
   const p=pt.matrixTransform(ctm.inverse());
   if(p.x<0||p.y<0||p.x>P.w||p.y>P.h)return;
+  const id='b'+hashId(myId).toString(36)+'-'+now.toString(36)+'-'+(localSeq++);
+  /* --- タップ位置補正 ---
+   * blobの表示位置 = アンカー + 揺らぎ(id,t)。そのままだと出現瞬間に揺らぎ分ずれるため、
+   * 現在時刻の揺らぎを逆算してアンカーから差し引き、タップ地点に正確に出現させる。
+   * 揺らぎはidと時刻の純関数なので、補正済みアンカーを共有すれば全ユーザーで一貫する。 */
+  const tmp={};
+  {
+    const rng=mulberry32(hashId(id));
+    tmp.f1=0.10+rng()*0.22;tmp.f2=0.05+rng()*0.14;tmp.f3=0.08+rng()*0.2;
+    tmp.p1=rng()*6.283;tmp.p2=rng()*6.283;tmp.p3=rng()*6.283;
+  }
+  const dv=driftAt(tmp,now/1000);
+  const ax=Math.min(Math.max(p.x-dv[0],30),P.w-30);
+  const ay=Math.min(Math.max(p.y-dv[1],30),P.h-30);
   const rec={
-    id:'b'+hashId(myId).toString(36)+'-'+now.toString(36)+'-'+(localSeq++),
+    id:id,
     cid:myId,
-    x:+(p.x/P.w).toFixed(4), y:+(p.y/P.h).toFixed(4),
+    x:+(ax/P.w).toFixed(4), y:+(ay/P.h).toFixed(4),
     r:Math.round(P.minR+Math.random()*(P.maxR-P.minR)),
   };
   clicksUsed++;
   if(CLICK_LIMIT&&clicksUsed>=CLICK_LIMIT)svg.classList.add('used');
-  // 1) 即時ローカル反映（Supabaseの成否に関わらずアートは動き続ける）
   makeBlob(rec);
   total++;updateHud();
-  // 2) live時のみネットワークへ
   if(live&&channel){
     try{
       Promise.resolve(channel.send({type:'broadcast',event:'spawn',payload:rec}))
@@ -373,12 +456,9 @@ svg.addEventListener('click',e=>{
   if(sb){
     withTimeout(sb.rpc('increment_mark'),API_TIMEOUT).then(({data,error})=>{
       if(error)throw error;
-      // RPCが新しい累計を返す場合はサーバー値に補正（返さない実装でもOK）
       const c=Number(data);
       if(isFinite(c)&&c>0){
         total=Math.max(total,c);
-        // 初期ロードに失敗していた場合はここでバックフィル
-        //（自分のblobは表示済みなので過去分 total-1 個を生成）
         if(!marksRendered)renderMarks(Math.max(total-1,0));
         updateHud();
       }
