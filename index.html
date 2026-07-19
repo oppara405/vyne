@@ -144,9 +144,11 @@ function addSeeds(){(CFG.seedBlobs||[]).forEach((s,i)=>makeBlob({id:'seed'+i,cid
  * ・配置/サイズはインデックスから決定論的に生成 → 全ユーザーの画面で同一
  * ・以降の新規クリックは最古のblobを押し出す（makeBlob内のMAXキャップ）
  * ・自分がクリック済みのblobは消さずに引き継ぐ */
+let marksRendered=false; // 初期blobの描画が済んだか（RPC経由のバックフィル判定用）
 function renderMarks(n){
-  const count=Math.min(n,MAX);
+  const count=Math.min(Number(n)||0,MAX);
   if(count<=0)return; // 0件のときはシード表示のまま
+  marksRendered=true;
   const own=blobs.filter(b=>b.own).map(b=>b.rec);
   clearBlobs();
   for(let i=0;i<count;i++){
@@ -272,16 +274,21 @@ function initSupabase(){
     sb=window.supabase.createClient(url,key);
   }catch(e){console.warn('[blob] Supabase初期化失敗 → ローカルモード',e);sb=null;return}
 
-  /* --- 初期ロード: Total Marks を global_marks から取得し、その数分のblobを表示 --- */
+  /* --- 初期ロード: Total Marks を global_marks から取得し、その数分のblobを表示 ---
+   * 注意: select('count') は PostgREST が count を集計関数と解釈して失敗することが
+   * あるため、select('*') で行ごと取得して count 列を読む */
   withTimeout(
-    sb.from('global_marks').select('count').eq('id',1).single(),
+    sb.from('global_marks').select('*').eq('id',1).single(),
     API_TIMEOUT
   ).then(({data,error})=>{
     if(error)throw error;
-    if(data&&typeof data.count==='number'){
-      total=Math.max(total,data.count); // ロード前のローカルクリックを失わない
-      renderMarks(total);               // Total Marks分の初期blobを表示
+    const c=Number(data&&data.count);
+    if(isFinite(c)&&c>=0){
+      total=Math.max(total,c); // ロード前のローカルクリックを失わない
+      renderMarks(total);      // Total Marks分の初期blobを表示
       updateHud();
+    }else{
+      console.warn('[blob] global_marksの応答にcount列が見つかりません:',data);
     }
   }).catch(e=>{
     console.warn('[blob] Total Marks取得失敗 → ローカル値を起点に継続',e&&e.message);
@@ -354,7 +361,14 @@ svg.addEventListener('click',e=>{
     withTimeout(sb.rpc('increment_mark'),API_TIMEOUT).then(({data,error})=>{
       if(error)throw error;
       // RPCが新しい累計を返す場合はサーバー値に補正（返さない実装でもOK）
-      if(typeof data==='number'&&isFinite(data)){total=Math.max(total,data);updateHud()}
+      const c=Number(data);
+      if(isFinite(c)&&c>0){
+        total=Math.max(total,c);
+        // 初期ロードに失敗していた場合はここでバックフィル
+        //（自分のblobは表示済みなので過去分 total-1 個を生成）
+        if(!marksRendered)renderMarks(Math.max(total-1,0));
+        updateHud();
+      }
     }).catch(e=>{
       console.warn('[blob] increment_mark失敗 → ローカルカウントで継続',e&&e.message);
     });
