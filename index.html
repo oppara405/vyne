@@ -7,7 +7,8 @@
 <style>
   html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:transparent;}
   #root{position:relative;width:100%;height:100%;}
-  svg{position:absolute;inset:0;width:100%;height:100%;display:block;cursor:crosshair;}
+  svg{position:absolute;inset:0;width:100%;height:100%;display:block;cursor:crosshair;
+    transform:translateZ(0); will-change:transform;} /* GPUレイヤー化: iOS Safariの描画残り対策 */
   svg.used{cursor:default;}
 </style>
 
@@ -76,8 +77,12 @@ const P=Object.assign({
   hudMarker:true,hudCoords:true,hudId:true,hudSize:11,hudC:'#1c1e22',
 },CFG.params||{});
 const SEL=Object.assign({bg:'#000000',text:'#ffffff'},CFG.selection||{});
+/* ---- モバイル軽量モード（自動判定） ----
+ * SVGフィルターはモバイルで重いため、ブラー弱め・30fps・blob数控えめで動かす */
+const IS_MOBILE=(window.matchMedia&&matchMedia('(pointer:coarse)').matches)||/iPhone|iPad|Android/i.test(navigator.userAgent);
+const PERF=Object.assign({mobileFps:30,mobileBlurScale:0.7,mobileMaxBlobs:25},CFG.perf||{});
 const HARD_CAP=50; // 表示上限（接続線がO(n^2)のためパフォーマンス保護）
-const MAX=Math.min(CFG.maxBlobs||40,HARD_CAP);
+const MAX=Math.min(CFG.maxBlobs||40,HARD_CAP,IS_MOBILE?PERF.mobileMaxBlobs:HARD_CAP);
 const SVGNS='http://www.w3.org/2000/svg';
 const svg=document.getElementById('svg');
 const bar=document.getElementById('bar'), barL=document.getElementById('barL'), barR=document.getElementById('barR');
@@ -91,11 +96,13 @@ try{
 
 /* ---------- SVG scaffold ---------- */
 svg.setAttribute('viewBox',`0 0 ${P.w} ${P.h}`);
+const BLUR=IS_MOBILE?Math.max(4,Math.round(P.blur*PERF.mobileBlurScale)):P.blur;
+const FRO=IS_MOBILE?'-25%':'-40%', FRS=IS_MOBILE?'150%':'180%'; // フィルター領域（狭いほど軽い）
 const a=P.gradAng*Math.PI/180;
 svg.innerHTML=
   `<defs>`
-  +`<filter id="goo" x="-40%" y="-40%" width="180%" height="180%">`
-  +`<feGaussianBlur in="SourceGraphic" stdDeviation="${P.blur}" result="b"/>`
+  +`<filter id="goo" x="${FRO}" y="${FRO}" width="${FRS}" height="${FRS}">`
+  +`<feGaussianBlur in="SourceGraphic" stdDeviation="${BLUR}" result="b"/>`
   +`<feColorMatrix in="b" values="1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 ${P.contrast} ${(-P.contrast*0.38).toFixed(1)}"/>`
   +`</filter>`
   +`<linearGradient id="grad" x1="${(50-Math.cos(a)*50).toFixed(1)}%" y1="${(50-Math.sin(a)*50).toFixed(1)}%" x2="${(50+Math.cos(a)*50).toFixed(1)}%" y2="${(50+Math.sin(a)*50).toFixed(1)}%">`
@@ -178,13 +185,19 @@ function posAt(b,t){
 
 /* ---------- render ---------- */
 let linePool=[];
-function render(){
+let lastFrame=0;
+const FRAME_MS=IS_MOBILE?Math.floor(1000/Math.max(PERF.mobileFps,10)):0; // モバイルはfps制限
+const FIX=IS_MOBILE?0:1; // モバイルは整数座標（再描画領域を減らす）
+function render(now){
+  requestAnimationFrame(render);
+  if(FRAME_MS&&now-lastFrame<FRAME_MS)return;
+  lastFrame=now;
   const t=Date.now()/1000;
   for(const b of blobs){
     posAt(b,t);
-    b.cEl.setAttribute('cx',b.x.toFixed(1));
-    b.cEl.setAttribute('cy',b.y.toFixed(1));
-    b.cEl.setAttribute('r',Math.max(b.r,0.1).toFixed(1));
+    b.cEl.setAttribute('cx',b.x.toFixed(FIX));
+    b.cEl.setAttribute('cy',b.y.toFixed(FIX));
+    b.cEl.setAttribute('r',Math.max(b.r,0.1).toFixed(FIX));
   }
   // 接続線（近距離plexus）
   let li=0;
@@ -195,8 +208,8 @@ function render(){
       if(d>P.lnDist)continue;
       let ln=linePool[li];
       if(!ln){ln=document.createElementNS(SVGNS,'line');linePool.push(ln);lineG.appendChild(ln)}
-      ln.setAttribute('x1',A.x.toFixed(1));ln.setAttribute('y1',A.y.toFixed(1));
-      ln.setAttribute('x2',B.x.toFixed(1));ln.setAttribute('y2',B.y.toFixed(1));
+      ln.setAttribute('x1',A.x.toFixed(FIX));ln.setAttribute('y1',A.y.toFixed(FIX));
+      ln.setAttribute('x2',B.x.toFixed(FIX));ln.setAttribute('y2',B.y.toFixed(FIX));
       ln.setAttribute('stroke',P.lnC);ln.setAttribute('stroke-width',P.lnW);
       ln.setAttribute('stroke-opacity',(P.lnA*(1-d/P.lnDist)).toFixed(3));
       ln.style.display='';
@@ -232,17 +245,17 @@ function render(){
       }else{lbl.setAttribute('fill',P.hudC);box.style.display='none'}
     }else{lbl.style.display='none';box.style.display='none'}
   }
-  requestAnimationFrame(render);
 }
 
 /* ---------- HUDバー（左下: カウンター / 右下: キャプション） ----------
  * Total Marks = 累計クリック数の実数（表示blob数が上限で頭打ちでも数字は増え続ける）。
  * total は初期ロードで global_marks から取得し、以降はローカルで加算。
  * Supabase障害時は「最後に取得できた値」を起点にローカル加算を継続する。 */
+const COUNT_OFFSET=('countOffset' in CFG)?CFG.countOffset:-1; // 表示は#00起点に合わせて-1
 function updateHud(){
   if(!CFG.counter)return;
   bar.style.display='';
-  barL.textContent=(CFG.captionLeft||'Total Marks:')+'\n# '+total.toLocaleString('en-US');
+  barL.textContent=(CFG.captionLeft||'Total Marks:')+'\n# '+Math.max(total+COUNT_OFFSET,0).toLocaleString('en-US');
   barR.textContent=CFG.captionRight||"Let's click/tap\nto leave your mark";
 }
 
