@@ -44,7 +44,7 @@ window.BLOB_CONFIG = {
     c1: "#ffffff", c2: "#a356e1",
     useGrad: true, gradAng: 0,
     blur: 15, contrast: 60, opacity: 1,
-    minR: 19, maxR: 113,
+    minR: 12, maxR: 82, /*minR: 19, maxR: 113  */
     speed: 50,
     pulse: 0.3,
     lnOn: true, lnDist: 300, lnW: 1, lnC: "#ffffff", lnA: 0.55,
