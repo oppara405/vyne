@@ -18,9 +18,19 @@ window.BLOB_CONFIG = {
   captionLeft: "Total Marks:",
   captionRight: "Let's click/tap\nto leave your mark",
 
-  /* ---- モバイル軽量モード（自動適用。必要なら調整） ---- */
+  /* ---- 初期表示 ----
+   * initialBlobs: null → Total Marks（DBの累計）の数だけ表示（従来の挙動）
+   *               数値 → Total Marksに関係なく常にその数で表示（上限は maxBlobs / mobileMaxBlobs）
+   * Supabase未接続かつ initialBlobs:null のときは seedBlobs を表示 */
+  initial: {
+    initialBlobs: null,
+  },
+
+  /* ---- フレームレート / モバイル軽量モード ----
+   * fps を下げるとコマ送り風（アナログ感）になる。1〜60。60以上は制限なし */
   perf: {
-    mobileFps: 24,        // モバイルのフレームレート上限
+    pcFps: 60,            // PCのフレームレート
+    mobileFps: 24,        // モバイルのフレームレート
     mobileBlurScale: 0.5, // モバイルでのブラー弱体化（0.5〜1）
     mobileMaxBlobs: 15,   // モバイルでの表示blob上限
   },

@@ -79,7 +79,8 @@ const P=Object.assign({
 },CFG.params||{});
 const SEL=Object.assign({bg:'#000000',text:'#ffffff'},CFG.selection||{});
 const IS_MOBILE=(window.matchMedia&&matchMedia('(pointer:coarse)').matches)||/iPhone|iPad|Android/i.test(navigator.userAgent);
-const PERF=Object.assign({mobileFps:60,mobileBlurScale:1,mobileMaxBlobs:50},CFG.perf||{});
+const PERF=Object.assign({pcFps:60,mobileFps:60,mobileBlurScale:1,mobileMaxBlobs:50},CFG.perf||{});
+const INIT_BLOBS=(CFG.initial&&typeof CFG.initial.initialBlobs==='number')?Math.max(0,CFG.initial.initialBlobs):null;
 const HARD_CAP=50;
 const MAX=Math.min(CFG.maxBlobs||40,HARD_CAP,IS_MOBILE?PERF.mobileMaxBlobs:HARD_CAP);
 const SVGNS='http://www.w3.org/2000/svg';
@@ -256,9 +257,14 @@ function driftAt(b,t){
 /* seed blobs（Supabase未接続時・Total Marks=0のときのフォールバック表示） */
 function addSeeds(){(CFG.seedBlobs||[]).forEach((s,i)=>makeBlob({id:'seed'+i,cid:null,x:s.x,y:s.y,r:s.r}))}
 
-/* Total Marks分の初期blobを生成（表示上限 min(maxBlobs,50)） */
+/* 初期blobを生成（数 = initialBlobs指定時はその値、未指定ならTotal Marks。表示上限 MAX）
+ * initialBlobs指定時は一度だけ生成し、Total Marks取得後も作り直さない */
 let marksRendered=false;
 function renderMarks(n){
+  if(INIT_BLOBS!==null){
+    if(marksRendered)return;
+    n=INIT_BLOBS;
+  }
   const count=Math.min(Number(n)||0,MAX);
   if(count<=0)return;
   marksRendered=true;
@@ -287,11 +293,16 @@ function posAt(b,t){
 /* ---------- render ---------- */
 let linePool=[];
 let lastFrame=0;
-const FRAME_MS=IS_MOBILE&&PERF.mobileFps<60?Math.floor(1000/Math.max(PERF.mobileFps,10)):0;
+const FPS=Math.min(Math.max(Number(IS_MOBILE?PERF.mobileFps:PERF.pcFps)||60,1),60);
+const FRAME_MS=FPS<60?1000/FPS:0;
 function render(now){
   requestAnimationFrame(render);
-  if(FRAME_MS&&now-lastFrame<FRAME_MS)return;
-  lastFrame=now;
+  if(FRAME_MS){
+    const el=now-lastFrame;
+    if(el<FRAME_MS-1)return;              // -1ms: vsync揺らぎで1コマ飛ばされるのを防ぐ
+    lastFrame+=FRAME_MS*Math.max(1,Math.floor(el/FRAME_MS)); // 固定間隔で進め、指定fpsどおりを維持
+    if(now-lastFrame>FRAME_MS)lastFrame=now;                 // タブ復帰などで大きく遅れたら再同期
+  }
   const t=Date.now()/1000;
   for(const b of blobs)posAt(b,t);
   // グーイ本体
@@ -484,7 +495,7 @@ svg.addEventListener('click',e=>{
 });
 
 /* ---------- init ---------- */
-addSeeds();
+if(INIT_BLOBS!==null&&INIT_BLOBS>0)renderMarks(INIT_BLOBS);else addSeeds();
 updateHud();
 initSupabase();
 requestAnimationFrame(render);
