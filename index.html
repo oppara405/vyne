@@ -1,0 +1,493 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Blob Network v4.1 — WebGL Edition</title>
+<style>
+  html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:transparent;}
+  #root{position:relative;width:100%;height:100%;}
+  #goo{position:absolute;inset:0;width:100%;height:100%;display:block;}
+  svg{position:absolute;inset:0;width:100%;height:100%;display:block;cursor:crosshair;}
+  svg.used{cursor:default;}
+</style>
+
+<!-- ============================================================
+     HUDバーのスタイル（★カスタマイズはこのブロックを編集★）
+     iframe内のため、サイト側CSSからは上書きできません。
+     ============================================================ -->
+<style id="hud-style">
+  @import url('https://fonts.googleapis.com/css2?family=Space+Mono&display=swap');
+  #bar{
+    position:absolute; left:0; right:0; bottom:0;
+    display:flex;
+    padding:10px 40px;              /* PC */
+    justify-content:space-between;
+    align-items:flex-start;
+    align-self:stretch;
+    pointer-events:none;
+    box-sizing:border-box;
+  }
+  @media (max-width:768px){
+    #bar{ padding:10px 20px; }      /* Mobile */
+  }
+  #bar .txt{
+    color:#FFF;
+    background:#000;                /* テキストエリア背景 */
+    font-family:"Space Mono",Consolas,monospace;
+    font-size:10px;
+    font-style:normal;
+    font-weight:400;
+    line-height:normal;
+    letter-spacing:1.8px;
+    padding:3px 6px;
+    white-space:pre;
+  }
+</style>
+</head>
+<body>
+<div id="root">
+  <canvas id="goo"></canvas><!-- グーイ描画: WebGL(GPU) -->
+  <svg id="svg" xmlns="http://www.w3.org/2000/svg" preserveAspectRatio="xMidYMid slice"></svg><!-- 線+HUD: フィルター無しSVG(軽量) -->
+  <div id="bar" style="display:none">
+    <div class="txt" id="barL"></div>
+    <div class="txt" id="barR"></div>
+  </div>
+</div>
+<!-- Supabase JS (CDN) — 読み込み失敗してもローカルモードで動作します -->
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script src="./config.js"></script>
+<script>
+"use strict";
+/* ============================================================
+ * BLOB NETWORK v4.1 — 埋め込みウィジェット本体（WebGL Edition）
+ *
+ * v4からの見た目修正:
+ *   ・メタボール場を 1/d² 型 → 有限半径カーネル (1-(d/R)²)² に変更
+ *     - 遠方に裾を引かないため、blobが多くても画面全体が薄く発色しない
+ *   ・エッジをピクセル精度でAA（fwidth）→ 旧SVG版のシャープな輪郭を再現
+ *   ・グラデーションを「blobごとの局所座標」で計算
+ *     - 旧SVG版（objectBoundingBox基準＝blob単位のグラデ）の見た目を再現
+ *     - 融合部は場の寄与率で色を加重ブレンド
+ * ============================================================ */
+const CFG=window.BLOB_CONFIG||{};
+const P=Object.assign({
+  w:1200,h:700,bg:'#ffffff',c1:'#d9e92c',c2:'#4fc3e8',useGrad:false,gradAng:45,
+  blur:14,contrast:28,opacity:1,minR:14,maxR:80,speed:50,pulse:0.3,
+  lnOn:true,lnDist:320,lnW:1.5,lnC:'#1c1e22',lnA:0.7,
+  hudMarker:true,hudCoords:true,hudId:true,hudSize:11,hudC:'#1c1e22',
+},CFG.params||{});
+const SEL=Object.assign({bg:'#000000',text:'#ffffff'},CFG.selection||{});
+const IS_MOBILE=(window.matchMedia&&matchMedia('(pointer:coarse)').matches)||/iPhone|iPad|Android/i.test(navigator.userAgent);
+const PERF=Object.assign({mobileFps:60,mobileBlurScale:1,mobileMaxBlobs:50},CFG.perf||{});
+const HARD_CAP=50;
+const MAX=Math.min(CFG.maxBlobs||40,HARD_CAP,IS_MOBILE?PERF.mobileMaxBlobs:HARD_CAP);
+const SVGNS='http://www.w3.org/2000/svg';
+const svg=document.getElementById('svg');
+const bar=document.getElementById('bar'), barL=document.getElementById('barL'), barR=document.getElementById('barR');
+
+/* ---------- client id ---------- */
+let myId;
+try{
+  myId=localStorage.getItem('blobClientId');
+  if(!myId){myId=(crypto.randomUUID?crypto.randomUUID():'c'+Math.random().toString(36).slice(2));localStorage.setItem('blobClientId',myId)}
+}catch(e){myId='c'+Math.random().toString(36).slice(2)}
+
+/* ============================================================
+ * WebGL レンダラー（グーイ本体・GPU実行）
+ * ============================================================ */
+const canvas=document.getElementById('goo');
+let gl=null,glProg=null,glU={},HAS_GL=false;
+const DPR=Math.min(window.devicePixelRatio||1,2);
+/* メタボールは有限半径カーネル (1-(d/R)^2)^2 を使用。R = r × MERGE_K が影響半径 */
+const MERGE_K=1.6+P.blur/25;                                   // blur → 融合の届く距離
+const THRESH=Math.pow(1-1/(MERGE_K*MERGE_K),2);                // 単独blobの輪郭がちょうど半径rになるしきい値
+const SOFT=Math.min(Math.max(6/P.contrast,0.02),0.3);          // contrast → エッジの柔らかさ（最小値として作用）
+function hex2rgb(h){const n=parseInt(h.slice(1),16);return[(n>>16&255)/255,(n>>8&255)/255,(n&255)/255]}
+
+function initGL(){
+  try{
+    gl=canvas.getContext('webgl',{antialias:false,alpha:false,depth:false,stencil:false,preserveDrawingBuffer:false})
+      ||canvas.getContext('experimental-webgl');
+  }catch(e){gl=null}
+  if(!gl){console.warn('[blob] WebGL利用不可 → SVGフォールバック描画');return false}
+  const hasDeriv=!!gl.getExtension('OES_standard_derivatives'); // ピクセル精度のエッジAA用
+  const vs=`attribute vec2 aP;void main(){gl_Position=vec4(aP,0.,1.);}`;
+  const fs=(hasDeriv?'#extension GL_OES_standard_derivatives : enable\n':'')
++`#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
+precision mediump float;
+#endif
+uniform vec2 uRes,uOffset,uGradDir;
+uniform float uScale,uSoft,uMergeK,uThresh,uOpacity;
+uniform int uCount;
+uniform vec3 uBlobs[${HARD_CAP}];
+uniform vec3 uC1,uC2,uBg;
+void main(){
+  vec2 frag=vec2(gl_FragCoord.x,uRes.y-gl_FragCoord.y);
+  vec2 l=(frag-uOffset)/uScale;              /* 論理座標(1200x700系)へ変換 */
+  float f=0.0;
+  vec3 cg=vec3(0.0);
+  for(int i=0;i<${HARD_CAP};i++){
+    if(i>=uCount)break;
+    vec2 d=l-uBlobs[i].xy;
+    float r=uBlobs[i].z;
+    float R=r*uMergeK;
+    float q=dot(d,d)/(R*R);
+    if(q<1.0){
+      float w=1.0-q; w*=w;                   /* 有限半径カーネル: 遠方はゼロ */
+      f+=w;
+      /* blobごとの局所グラデーション（旧SVG版のobjectBoundingBox挙動を再現）
+         融合部は場の寄与で加重ブレンド */
+      float ti=clamp(dot(d/(2.0*r),uGradDir)+0.5,0.0,1.0);
+      cg+=w*mix(uC1,uC2,ti);
+    }
+  }
+  ${hasDeriv
+    ?'float aa=max(fwidth(f)*1.2,uSoft*0.15);'   /* 画面上ほぼ1pxのシャープな輪郭 */
+    :'float aa=uSoft;'}
+  float a=smoothstep(uThresh-aa,uThresh+aa,f)*uOpacity;
+  vec3 grad=f>0.0?cg/f:uC1;
+  vec3 col=mix(uBg,grad,a);
+  gl_FragColor=vec4(col,1.0);
+}`;
+  function sh(type,src){const s=gl.createShader(type);gl.shaderSource(s,src);gl.compileShader(s);
+    if(!gl.getShaderParameter(s,gl.COMPILE_STATUS)){console.warn('[blob] shader error:',gl.getShaderInfoLog(s));return null}return s}
+  const v=sh(gl.VERTEX_SHADER,vs),f=sh(gl.FRAGMENT_SHADER,fs);
+  if(!v||!f)return false;
+  glProg=gl.createProgram();gl.attachShader(glProg,v);gl.attachShader(glProg,f);gl.linkProgram(glProg);
+  if(!gl.getProgramParameter(glProg,gl.LINK_STATUS)){console.warn('[blob] link error:',gl.getProgramInfoLog(glProg));return false}
+  gl.useProgram(glProg);
+  const buf=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,buf);
+  gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,3,-1,-1,3]),gl.STATIC_DRAW);
+  const aP=gl.getAttribLocation(glProg,'aP');gl.enableVertexAttribArray(aP);gl.vertexAttribPointer(aP,2,gl.FLOAT,false,0,0);
+  ['uRes','uOffset','uGradDir','uScale','uSoft','uMergeK','uThresh','uOpacity','uCount','uBlobs','uC1','uC2','uBg']
+    .forEach(n=>glU[n]=gl.getUniformLocation(glProg,n));
+  // 固定uniform
+  const ga=P.gradAng*Math.PI/180;
+  gl.uniform2f(glU.uGradDir,Math.cos(ga),Math.sin(ga));
+  gl.uniform1f(glU.uSoft,SOFT);
+  gl.uniform1f(glU.uMergeK,MERGE_K);
+  gl.uniform1f(glU.uThresh,THRESH);
+  gl.uniform1f(glU.uOpacity,P.opacity);
+  gl.uniform3fv(glU.uC1,hex2rgb(P.c1));
+  gl.uniform3fv(glU.uC2,hex2rgb(P.useGrad?P.c2:P.c1)); // 単色時はc1=c2
+  gl.uniform3fv(glU.uBg,hex2rgb(P.bg));
+  return true;
+}
+let vpScale=1,vpOffX=0,vpOffY=0;
+function resizeGL(){
+  const cw=canvas.clientWidth,ch=canvas.clientHeight;
+  if(!cw||!ch)return;
+  canvas.width=Math.round(cw*DPR);canvas.height=Math.round(ch*DPR);
+  // preserveAspectRatio: slice と同じマッピング
+  const s=Math.max(cw/P.w,ch/P.h);
+  vpScale=s*DPR;
+  vpOffX=(cw-P.w*s)/2*DPR;
+  vpOffY=(ch-P.h*s)/2*DPR;
+  if(gl){
+    gl.viewport(0,0,canvas.width,canvas.height);
+    gl.uniform2f(glU.uRes,canvas.width,canvas.height);
+    gl.uniform2f(glU.uOffset,vpOffX,vpOffY);
+    gl.uniform1f(glU.uScale,vpScale);
+  }
+}
+const blobArr=new Float32Array(HARD_CAP*3);
+function drawGL(){
+  for(let i=0;i<blobs.length;i++){
+    const b=blobs[i];
+    blobArr[i*3]=b.x;blobArr[i*3+1]=b.y;blobArr[i*3+2]=b.r;
+  }
+  gl.uniform1i(glU.uCount,blobs.length);
+  gl.uniform3fv(glU.uBlobs,blobArr);
+  gl.drawArrays(gl.TRIANGLES,0,3);
+}
+
+/* ---------- SVG scaffold（線+HUDのみ。フィルター不使用） ---------- */
+svg.setAttribute('viewBox',`0 0 ${P.w} ${P.h}`);
+HAS_GL=initGL();
+console.info('[blob] renderer:',HAS_GL?'WebGL (GPU)':'SVG fallback');
+svg.innerHTML=
+  (HAS_GL?'':`<rect width="${P.w}" height="${P.h}" fill="${P.bg}"/>`
+    +`<defs><linearGradient id="grad" x1="0%" y1="0%" x2="100%" y2="0%">`
+    +`<stop offset="0%" stop-color="${P.c1}"/><stop offset="100%" stop-color="${P.useGrad?P.c2:P.c1}"/></linearGradient></defs>`
+    +`<g id="goog" fill="${P.useGrad?'url(#grad)':P.c1}" opacity="${P.opacity}"></g>`)
+  +`<g id="lineg"></g><g id="hudg"></g>`;
+const gooG=svg.querySelector('#goog'), lineG=svg.querySelector('#lineg'), hudG=svg.querySelector('#hudg');
+resizeGL();
+window.addEventListener('resize',resizeGL);
+
+/* ---------- 決定論的モーション ---------- */
+function mulberry32(s){return function(){s|=0;s=s+0x6D2B79F5|0;let t=Math.imul(s^s>>>15,1|s);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296}}
+function hashId(id){let h=2166136261;const s=String(id);for(let i=0;i<s.length;i++){h^=s.charCodeAt(i);h=Math.imul(h,16777619)}return h>>>0}
+
+/* ---------- blobs ---------- */
+let blobs=[], total=0, localSeq=0, displaySeq=0;
+function makeBlob(rec){ // rec: {id, cid, x(0..1), y(0..1), r(px)}
+  const rng=mulberry32(hashId(rec.id));
+  const b={
+    id:rec.id, cid:rec.cid||null,
+    ax:rec.x*P.w, ay:rec.y*P.h, r0:rec.r,
+    f1:0.10+rng()*0.22, f2:0.05+rng()*0.14, f3:0.08+rng()*0.2,
+    p1:rng()*6.283, p2:rng()*6.283, p3:rng()*6.283, pf:0.5+rng(),
+    x:0,y:0,r:rec.r, own:rec.cid===myId,
+  };
+  b.num=displaySeq++;
+  b.rec=rec;
+  if(!HAS_GL){b.cEl=document.createElementNS(SVGNS,'circle');gooG.appendChild(b.cEl)}
+  b.hEl=document.createElementNS(SVGNS,'g');
+  b.hEl.innerHTML=`<path fill="none"/><circle r="1.6"/><rect rx="1"/><text font-family="Consolas,Menlo,monospace"></text>`;
+  hudG.appendChild(b.hEl);
+  blobs.push(b);
+  while(blobs.length>MAX)removeBlob(blobs[0]);
+  return b;
+}
+function removeBlob(b){if(b.cEl)b.cEl.remove();b.hEl.remove();blobs.splice(blobs.indexOf(b),1)}
+function clearBlobs(){while(blobs.length)removeBlob(blobs[0]);displaySeq=0}
+
+/* 揺らぎオフセット（posAtと同一式）。タップ位置補正に使用 */
+function driftAt(b,t){
+  const k=P.speed/25,A=P.speed*1.2,T=t*k;
+  return [A*(Math.sin(T*b.f1+b.p1)+0.6*Math.sin(T*b.f3+b.p3)),
+          A*(Math.cos(T*b.f2+b.p2)+0.6*Math.cos(T*b.f1*1.3+b.p1*1.7))];
+}
+
+/* seed blobs（Supabase未接続時・Total Marks=0のときのフォールバック表示） */
+function addSeeds(){(CFG.seedBlobs||[]).forEach((s,i)=>makeBlob({id:'seed'+i,cid:null,x:s.x,y:s.y,r:s.r}))}
+
+/* Total Marks分の初期blobを生成（表示上限 min(maxBlobs,50)） */
+let marksRendered=false;
+function renderMarks(n){
+  const count=Math.min(Number(n)||0,MAX);
+  if(count<=0)return;
+  marksRendered=true;
+  const own=blobs.filter(b=>b.own).map(b=>b.rec);
+  clearBlobs();
+  for(let i=0;i<count;i++){
+    const k=n-count+i;
+    const rng=mulberry32(hashId('mark'+k));
+    makeBlob({id:'mark'+k,cid:null,
+      x:+(0.08+rng()*0.84).toFixed(4),
+      y:+(0.08+rng()*0.84).toFixed(4),
+      r:Math.round(P.minR+(P.maxR-P.minR)*rng())});
+  }
+  own.forEach(rec=>makeBlob(rec));
+}
+
+/* ---------- 物理（時刻の純関数） ---------- */
+function posAt(b,t){
+  const d=driftAt(b,t);
+  const m=30;
+  b.x=Math.min(Math.max(b.ax+d[0],m),P.w-m);
+  b.y=Math.min(Math.max(b.ay+d[1],m),P.h-m);
+  b.r=b.r0*(1+P.pulse*0.25*Math.sin(t*b.pf+b.p2));
+}
+
+/* ---------- render ---------- */
+let linePool=[];
+let lastFrame=0;
+const FRAME_MS=IS_MOBILE&&PERF.mobileFps<60?Math.floor(1000/Math.max(PERF.mobileFps,10)):0;
+function render(now){
+  requestAnimationFrame(render);
+  if(FRAME_MS&&now-lastFrame<FRAME_MS)return;
+  lastFrame=now;
+  const t=Date.now()/1000;
+  for(const b of blobs)posAt(b,t);
+  // グーイ本体
+  if(HAS_GL)drawGL();
+  else for(const b of blobs){
+    b.cEl.setAttribute('cx',b.x.toFixed(1));
+    b.cEl.setAttribute('cy',b.y.toFixed(1));
+    b.cEl.setAttribute('r',Math.max(b.r,0.1).toFixed(1));
+  }
+  // 接続線（近距離plexus）
+  let li=0;
+  if(P.lnOn){
+    for(let i=0;i<blobs.length;i++)for(let j=i+1;j<blobs.length;j++){
+      const A=blobs[i],B=blobs[j];
+      const d=Math.hypot(A.x-B.x,A.y-B.y);
+      if(d>P.lnDist)continue;
+      let ln=linePool[li];
+      if(!ln){ln=document.createElementNS(SVGNS,'line');linePool.push(ln);lineG.appendChild(ln)}
+      ln.setAttribute('x1',A.x.toFixed(1));ln.setAttribute('y1',A.y.toFixed(1));
+      ln.setAttribute('x2',B.x.toFixed(1));ln.setAttribute('y2',B.y.toFixed(1));
+      ln.setAttribute('stroke',P.lnC);ln.setAttribute('stroke-width',P.lnW);
+      ln.setAttribute('stroke-opacity',(P.lnA*(1-d/P.lnDist)).toFixed(3));
+      ln.style.display='';
+      li++;
+    }
+  }
+  for(let k2=li;k2<linePool.length;k2++)linePool[k2].style.display='none';
+  // トラッキングHUD
+  const s=P.hudSize, cr=Math.max(5,s*0.55);
+  for(const b of blobs){
+    const g=b.hEl;
+    g.setAttribute('transform',`translate(${b.x.toFixed(1)},${b.y.toFixed(1)})`);
+    const [cross,dot,box,lbl]=g.children;
+    if(P.hudMarker){
+      cross.setAttribute('d',`M${-cr} 0H${cr}M0 ${-cr}V${cr}`);
+      cross.setAttribute('stroke',b.own?SEL.bg:P.hudC);cross.setAttribute('stroke-width',b.own?1.5:1);
+      dot.setAttribute('fill',b.own?SEL.bg:P.hudC);
+      cross.style.display='';dot.style.display='';
+    }else{cross.style.display='none';dot.style.display='none'}
+    if(P.hudCoords||P.hudId){
+      const id=P.hudId?('#'+String(b.num).padStart(2,'0')):'';
+      const co=P.hudCoords?` ${Math.round(b.x)},${Math.round(b.y)}`:'';
+      lbl.textContent=(id+co).trim();
+      lbl.setAttribute('x',cr+4);lbl.setAttribute('y',-cr-3);
+      lbl.setAttribute('font-size',s);
+      lbl.style.display='';
+      if(b.own){
+        lbl.setAttribute('fill',SEL.text);
+        const w=lbl.getComputedTextLength();
+        box.setAttribute('x',cr+1);box.setAttribute('y',-cr-3-s*0.85);
+        box.setAttribute('width',w+6);box.setAttribute('height',s*1.15);
+        box.setAttribute('fill',SEL.bg);box.style.display='';
+      }else{lbl.setAttribute('fill',P.hudC);box.style.display='none'}
+    }else{lbl.style.display='none';box.style.display='none'}
+  }
+}
+
+/* ---------- HUDバー ---------- */
+const COUNT_OFFSET=('countOffset' in CFG)?CFG.countOffset:-1;
+function updateHud(){
+  if(!CFG.counter)return;
+  bar.style.display='';
+  barL.textContent=(CFG.captionLeft||'Total Marks:')+'\n# '+Math.max(total+COUNT_OFFSET,0).toLocaleString('en-US');
+  barR.textContent=CFG.captionRight||"Let's click/tap\nto leave your mark";
+}
+
+/* ============================================================
+ * Supabase リアルタイム連携（変更なし）
+ * ============================================================ */
+let sb=null, channel=null, live=false;
+const API_TIMEOUT=4000;
+function withTimeout(p,ms){
+  return Promise.race([p,new Promise((_,rej)=>setTimeout(()=>rej(new Error('timeout')),ms))]);
+}
+function validRec(p){
+  return p&&typeof p.x==='number'&&p.x>=0&&p.x<=1
+    &&typeof p.y==='number'&&p.y>=0&&p.y<=1
+    &&typeof p.r==='number'&&p.r>=1&&p.r<=500
+    &&typeof p.id==='string'&&p.id.length<=80;
+}
+
+function initSupabase(){
+  const su=CFG.supabase||{};
+  const url=(su.projectUrl||'').trim(), key=(su.anonKey||'').trim();
+  if(!url||!key){console.info('[blob] Supabase未設定 → ローカルモードで起動');return}
+  if(!window.supabase||!window.supabase.createClient){
+    console.warn('[blob] supabase-js CDNの読み込みに失敗 → ローカルモード');return}
+  try{
+    sb=window.supabase.createClient(url,key);
+  }catch(e){console.warn('[blob] Supabase初期化失敗 → ローカルモード',e);sb=null;return}
+
+  withTimeout(
+    sb.from('global_marks').select('*').eq('id',1).single(),
+    API_TIMEOUT
+  ).then(({data,error})=>{
+    if(error)throw error;
+    const c=Number(data&&data.count);
+    if(isFinite(c)&&c>=0){
+      total=Math.max(total,c);
+      renderMarks(total);
+      updateHud();
+    }else{
+      console.warn('[blob] global_marksの応答にcount列が見つかりません:',data);
+    }
+  }).catch(e=>{
+    console.warn('[blob] Total Marks取得失敗 → ローカル値を起点に継続',e&&e.message);
+  });
+
+  const rxLast=new Map();
+  try{
+    channel=sb.channel('blob-network',{config:{broadcast:{self:false}}});
+    channel.on('broadcast',{event:'spawn'},msg=>{
+      try{
+        const p=(msg&&msg.payload)||{};
+        if(!validRec(p))return;
+        const now=Date.now(), cid=String(p.cid||'?');
+        if(now-(rxLast.get(cid)||0)<250)return;
+        rxLast.set(cid,now);
+        makeBlob({id:p.id,cid:p.cid,x:p.x,y:p.y,r:p.r});
+        total++;updateHud();
+      }catch(e){console.warn('[blob] broadcast受信処理エラー',e)}
+    });
+    channel.subscribe(status=>{
+      if(status==='SUBSCRIBED'){
+        if(!live)console.info('[blob] Supabase Realtime 接続');
+        live=true;
+      }else if(status==='CHANNEL_ERROR'||status==='TIMED_OUT'||status==='CLOSED'){
+        if(live)console.warn('[blob] Realtime切断 → ローカルモードにフォールバック（自動再接続待ち）');
+        live=false;
+      }
+    });
+  }catch(e){console.warn('[blob] Realtimeチャンネル作成失敗 → ローカルモード',e);channel=null;live=false}
+}
+
+/* ---------- クリックでblob追加 ---------- */
+let clicksUsed=0, lastClickAt=0;
+const CLICK_LIMIT=('clickLimit' in CFG)?CFG.clickLimit:1;
+const THROTTLE_MS=300;
+svg.addEventListener('click',e=>{
+  if(CLICK_LIMIT&&clicksUsed>=CLICK_LIMIT)return;
+  const now=Date.now();
+  if(now-lastClickAt<THROTTLE_MS)return;
+  lastClickAt=now;
+  const pt=svg.createSVGPoint();pt.x=e.clientX;pt.y=e.clientY;
+  const ctm=svg.getScreenCTM();if(!ctm)return;
+  const p=pt.matrixTransform(ctm.inverse());
+  if(p.x<0||p.y<0||p.x>P.w||p.y>P.h)return;
+  const id='b'+hashId(myId).toString(36)+'-'+now.toString(36)+'-'+(localSeq++);
+  /* タップ位置補正: 現在時刻の揺らぎを逆算してアンカーから差し引き、
+   * タップ地点に正確に出現させる（揺らぎはidと時刻の純関数なので全ユーザーで一貫） */
+  const tmp={};
+  {
+    const rng=mulberry32(hashId(id));
+    tmp.f1=0.10+rng()*0.22;tmp.f2=0.05+rng()*0.14;tmp.f3=0.08+rng()*0.2;
+    tmp.p1=rng()*6.283;tmp.p2=rng()*6.283;tmp.p3=rng()*6.283;
+  }
+  const dv=driftAt(tmp,now/1000);
+  const ax=Math.min(Math.max(p.x-dv[0],30),P.w-30);
+  const ay=Math.min(Math.max(p.y-dv[1],30),P.h-30);
+  const rec={
+    id:id,
+    cid:myId,
+    x:+(ax/P.w).toFixed(4), y:+(ay/P.h).toFixed(4),
+    r:Math.round(P.minR+Math.random()*(P.maxR-P.minR)),
+  };
+  clicksUsed++;
+  if(CLICK_LIMIT&&clicksUsed>=CLICK_LIMIT)svg.classList.add('used');
+  makeBlob(rec);
+  total++;updateHud();
+  if(live&&channel){
+    try{
+      Promise.resolve(channel.send({type:'broadcast',event:'spawn',payload:rec}))
+        .then(res=>{if(res!=='ok')console.warn('[blob] broadcast送信失敗:',res)})
+        .catch(e=>console.warn('[blob] broadcast送信エラー',e));
+    }catch(e){console.warn('[blob] broadcast送信例外',e)}
+  }
+  if(sb){
+    withTimeout(sb.rpc('increment_mark'),API_TIMEOUT).then(({data,error})=>{
+      if(error)throw error;
+      const c=Number(data);
+      if(isFinite(c)&&c>0){
+        total=Math.max(total,c);
+        if(!marksRendered)renderMarks(Math.max(total-1,0));
+        updateHud();
+      }
+    }).catch(e=>{
+      console.warn('[blob] increment_mark失敗 → ローカルカウントで継続',e&&e.message);
+    });
+  }
+});
+
+/* ---------- init ---------- */
+addSeeds();
+updateHud();
+initSupabase();
+requestAnimationFrame(render);
+</script>
+</body>
+</html>
