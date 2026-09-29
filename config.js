@@ -51,7 +51,7 @@ window.BLOB_CONFIG = {
    * 色は #hex / hsl() どちらでも可。基本トーンは S83 / L44 */
   art: {
     bg:   "hsl(228, 72%, 39%)",  // 背景（青）
-    edge: "hsl(200,83%,44%)",  // blobの輪郭側（青寄り）
+    edge: "hsl(200, 51%, 52%)",  // blobの輪郭側（青寄り）
     core: "hsl(140,83%,44%)",  // blobの中心＝出現位置（緑）
     hot:  "#E73600",           // キーカラー：座標が密集した場所
     pixel: 4,          // ドット1マスの大きさ（論理px。1200幅で150マス）大きいほど粗い
@@ -63,10 +63,12 @@ window.BLOB_CONFIG = {
     hotMin: 1.5,       // この密集度からオレンジが混ざり始める（≒近くに2〜3個）
     hotMax: 3.2,       // この密集度で完全にオレンジ（≒近くに4個前後）
     hotSpill: 0.2,     // 盛り上がり周辺の背景にも散るオレンジ粒の量（0で無し）
-    bgNoise: 0.01,     // 背景に点在するグレーのドットノイズの比率（0〜1）
-    noiseColor: null,  // null=背景色の色相から自動生成（青なら #7682B2 付近）。色を直接指定も可
-    noisePixel: 8,     // ノイズのドット1マスの大きさ（論理px）。null=pixelと同じ
-    noiseFps: 0.6,     // ノイズが切り替わる速さ（回/秒）。null=grainFpsの1/10
+    bgNoise: 0.04,     // 背景に点在するグレーのドットノイズの比率（0〜1）
+    noiseColor: "#4b588b",  // null=背景色の色相から自動生成（青なら #7682B2 付近）。色を直接指定も可
+    noisePixel: 4,     // ノイズのドット1マスの大きさ（論理px）。null=pixelと同じ
+    noiseFps: 0.4,     // ノイズが切り替わる速さ（回/秒）。null=grainFpsの1/10
+    bgShape: 0,        // ノイズの形。0=正方形のドット / 1=横線（高さ noisePixel の長方形）
+    noiseLineLen: [3, 20], // bgShape:1 のときの横線の長さ（ドット数の最小, 最大）
   },
 
   /* ---- 盛り上がり（オレンジ箇所）に高速で出る文字 ---- */
@@ -83,12 +85,13 @@ window.BLOB_CONFIG = {
    * 終了後は最新 keep 件だけ残し、ほかはカットで消え、hideSec 秒後にカットで戻ってくる */
   climax: {
     on: true,
+    requireClick: true,  // true=このページで自分がクリックして自分のblobが出てから発動 / false=クリックなしでも発動
     minBlobs: 15,
-    holdSec: 6,
-    durationSec: 2,
-    keep: 8,
+    holdSec: 8,
+    durationSec: 1.5,
+    keep: 15,
     hideSec: 60,         // 消えたblobが画面に出ない秒数
-    cooldownSec: 10,     // 次のクライマックスまでの最短間隔（秒）
+    cooldownSec: 0,     // 次のクライマックスまでの最短間隔（秒）
     letters: 26,         // 点滅する文字の数
     letterColors: ["#ffffff", "#000000"],
   },
@@ -99,9 +102,9 @@ window.BLOB_CONFIG = {
     chars: "VYNE",
     color: "#ffffff",
     size: "clamp(28px,4.2vw,64px)",
-    interval: [0.2, 1.0],  // 次の文字が出るまでの秒数（最小, 最大）
+    interval: [0.1, 1.0],  // 次の文字が出るまでの秒数（最小, 最大）
     life: [1.2, 3.5],      // 1文字が表示される秒数（最小, 最大）
-    max: 22,                // 同時に表示する最大数
+    max: 27,                // 同時に表示する最大数
   },
 
   /* ---- 描画パラメーター（形・動き・線・HUD） ---- */
