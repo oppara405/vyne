@@ -12,6 +12,8 @@
   svg.used{cursor:default;}
   #letters{position:absolute;inset:0;overflow:hidden;pointer-events:none;}
   #letters span{position:absolute;transform:translate(-50%,-50%);line-height:1;white-space:pre;}
+  #letters span.clx{animation:vyneBlink var(--d,.15s) steps(1) infinite;animation-delay:var(--dl,0s);}
+  @keyframes vyneBlink{50%{visibility:hidden}}
 </style>
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Open+Sans:wght@400&display=swap" rel="stylesheet">
@@ -87,7 +89,15 @@ const ART=Object.assign({
   bg:'hsl(228,83%,44%)',edge:'hsl(200,83%,44%)',core:'hsl(140,83%,44%)',hot:'#E73600',
   pixel:8,steps:4,scatter:0.6,shimmer:0.35,grainFps:10,
   hotRadius:90,hotMin:2.0,hotMax:3.2,hotSpill:0.2,
+  bgNoise:0.2,noiseColor:null,noiseFps:8,
 },CFG.art||{});
+/* 盛り上がり（オレンジ箇所）に高速で出る文字 */
+const HLET=Object.assign({on:true,interval:[0.04,0.18],life:[0.15,0.5],max:30},CFG.hotLetters||{});
+/* クライマックス（グリッチ＋反転 → 飛散） */
+const CLX=Object.assign({
+  on:true,minBlobs:10,holdSec:3,durationSec:2,keep:8,scatterSec:1.2,hideSec:30,cooldownSec:10,
+  letters:26,letterColors:['#ffffff','#000000'],
+},CFG.climax||{});
 const LET=Object.assign({
   on:true,chars:'VYNE',color:'#000000',font:'"Open Sans","Helvetica Neue",Arial,sans-serif',
   size:'clamp(28px,4.2vw,64px)',weight:400,interval:[0.6,2.0],life:[1.2,3.5],max:6,
@@ -122,6 +132,14 @@ const THRESH=Math.pow(1-1/(MERGE_K*MERGE_K),2);                // 単独blobの�
 const _cx=document.createElement('canvas').getContext('2d');
 function css2hex(c){_cx.fillStyle='#000';_cx.fillStyle=c;return _cx.fillStyle}
 function css2rgb(c){const n=parseInt(css2hex(c).slice(1),16);return[(n>>16&255)/255,(n>>8&255)/255,(n&255)/255]}
+function hueOf(c){
+  const [r,g,b]=css2rgb(c),mx=Math.max(r,g,b),mn=Math.min(r,g,b),d=mx-mn;
+  if(!d)return 0;
+  const h=mx===r?((g-b)/d)%6:mx===g?(b-r)/d+2:(r-g)/d+4;
+  return (h*60+360)%360;
+}
+/* 背景ノイズ色: 未指定なら背景色の色相で「ごく薄く色味のあるグレー」を自動生成（青→ #7682B2 付近） */
+const NOISE_COLOR=ART.noiseColor||`hsl(${hueOf(ART.bg).toFixed(1)},28%,58%)`;
 
 function initGL(){
   try{
@@ -140,7 +158,8 @@ uniform float uScale,uMergeK,uThresh,uOpacity;
 uniform float uPix,uSteps,uScatter,uShimmer,uSeed,uHotR,uHotMin,uHotMax,uHotSpill;
 uniform int uCount;
 uniform vec3 uBlobs[${HARD_CAP}];
-uniform vec3 uEdge,uCore,uHot,uBg;
+uniform vec3 uEdge,uCore,uHot,uBg,uNoise;
+uniform float uTime,uNoiseAmt,uNoiseFps,uGlitch,uGSeed;
 float h21(vec2 p){p=fract(p*vec2(123.34,456.21));p+=dot(p,p+45.32);return fract(p.x*p.y);}
 /* 静的な粒(hs) + コマごとに変わる粒(hd)。shimmerが大きいほどざわつく */
 float grain(vec2 c,float k){
@@ -149,6 +168,23 @@ float grain(vec2 c,float k){
 void main(){
   vec2 frag=vec2(gl_FragCoord.x,uRes.y-gl_FragCoord.y);
   vec2 l=(frag-uOffset)/uScale;              /* 論理座標(1200x700系)へ変換 */
+  float inv=0.0,solid=0.0;
+  if(uGlitch>0.5){
+    /* クライマックス: 全体の青⇔オレンジを反転。大小の長方形ブロックが横ずれし、
+       ブロック内は反転が戻る（反転/非反転がモザイク状に入り混じる） */
+    inv=1.0;
+    for(int k=0;k<3;k++){
+      float fk=float(k);
+      vec2 bs=k==0?vec2(420.0,90.0):(k==1?vec2(160.0,36.0):vec2(60.0,12.0));
+      vec2 bid=floor((l+vec2(fk*37.0,fk*19.0))/bs);
+      float r=h21(bid+vec2(fk*13.1,uGSeed));
+      if(r<0.3){
+        l.x+=(h21(bid*1.3+vec2(uGSeed,fk))-0.5)*bs.x*1.2;
+        inv=1.0-inv;
+        if(k<2&&r<0.07)solid=1.0+step(0.035,r);  /* 大きめの長方形の一部はベタ塗り（1=ノイズ色 2=キーカラー） */
+      }
+    }
+  }
   vec2 cell=floor(l/uPix);                   /* 論理座標に固定した粗いドット */
   vec2 c=(cell+0.5)*uPix;
   float f=0.0,m=0.0,dens=0.0,hr2=uHotR*uHotR;
@@ -167,15 +203,26 @@ void main(){
      scatterが大きいほど裾が長い（v^(1/(0.7*scatter))） */
   float p=v>=1.0?1.0:pow(v,1.0/(0.7*uScatter));
   float hot=smoothstep(uHotMin,uHotMax,dens);
-  vec3 col=uBg;
+  vec3 B=inv>0.5?uHot:uBg, H=inv>0.5?uBg:uHot;   /* クライマックス中は青⇔オレンジ反転 */
+  vec3 col=B;
   if(n1<p){
     float t=smoothstep(0.15,0.95,m);                   /* 各blobの出現位置(中心)=緑 → 外側=青。融合部でも中心だけ緑 */
     t+=(grain(cell,3.1)-0.5)*0.35;                     /* 粒ごとの色ゆらぎ（砂の混色感） */
     float tq=clamp(floor(t*uSteps+n2)/uSteps,0.0,1.0);  /* 階調を量子化＋ディザ */
     col=mix(uEdge,uCore,tq);
-    if(n3<hot)col=uHot;
-  }else if(n3<hot*uHotSpill)col=uHot;       /* 盛り上がり周辺に散るオレンジの粒 */
-  gl_FragColor=vec4(mix(uBg,col,uOpacity),1.0);
+    if(n3<hot)col=H;
+  }else if(n3<hot*uHotSpill)col=H;          /* 盛り上がり周辺に散るオレンジの粒 */
+  else{
+    /* 背景のグリッチノイズ: 2ドット高の横帯ごとに、長さの違う横線がランダムに走る。
+       帯ごとに切り替わるタイミングをずらし、ビデオノイズのようにちらつかせる */
+    float row=floor(cell.y/2.0);
+    float rs=floor(uTime*uNoiseFps+h21(vec2(row,11.0))*4.0);
+    float segLen=3.0+floor(h21(vec2(row,rs+7.0))*30.0);
+    float seg=floor((cell.x+h21(vec2(row,rs+3.0))*64.0)/segLen);
+    if(h21(vec2(seg,row+rs*0.37))<uNoiseAmt)col=uNoise;
+  }
+  if(solid>1.5)col=uHot;else if(solid>0.5)col=uNoise;
+  gl_FragColor=vec4(mix(B,col,uOpacity),1.0);
 }`;
   function sh(type,src){const s=gl.createShader(type);gl.shaderSource(s,src);gl.compileShader(s);
     if(!gl.getShaderParameter(s,gl.COMPILE_STATUS)){console.warn('[blob] shader error:',gl.getShaderInfoLog(s));return null}return s}
@@ -188,7 +235,8 @@ void main(){
   gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,3,-1,-1,3]),gl.STATIC_DRAW);
   const aP=gl.getAttribLocation(glProg,'aP');gl.enableVertexAttribArray(aP);gl.vertexAttribPointer(aP,2,gl.FLOAT,false,0,0);
   ['uRes','uOffset','uScale','uMergeK','uThresh','uOpacity','uCount','uBlobs','uEdge','uCore','uHot','uBg',
-   'uPix','uSteps','uScatter','uShimmer','uSeed','uHotR','uHotMin','uHotMax','uHotSpill']
+   'uPix','uSteps','uScatter','uShimmer','uSeed','uHotR','uHotMin','uHotMax','uHotSpill',
+   'uNoise','uTime','uNoiseAmt','uNoiseFps','uGlitch','uGSeed']
     .forEach(n=>glU[n]=gl.getUniformLocation(glProg,n));
   // 固定uniform
   gl.uniform1f(glU.uMergeK,MERGE_K);
@@ -206,6 +254,10 @@ void main(){
   gl.uniform1f(glU.uHotMin,ART.hotMin);
   gl.uniform1f(glU.uHotMax,Math.max(ART.hotMax,ART.hotMin+0.01));
   gl.uniform1f(glU.uHotSpill,ART.hotSpill);
+  gl.uniform3fv(glU.uNoise,css2rgb(NOISE_COLOR));
+  gl.uniform1f(glU.uNoiseAmt,Math.min(Math.max(ART.bgNoise,0),1));
+  gl.uniform1f(glU.uNoiseFps,Math.max(ART.noiseFps,0));
+  gl.uniform1f(glU.uGlitch,0);
   return true;
 }
 let vpScale=1,vpOffX=0,vpOffY=0;
@@ -232,7 +284,11 @@ function drawGL(){
     blobArr[i*3]=b.x;blobArr[i*3+1]=b.y;blobArr[i*3+2]=b.r;
   }
   gl.uniform1i(glU.uCount,blobs.length);
-  gl.uniform1f(glU.uSeed,Math.floor(performance.now()/1000*ART.grainFps)%997+1); // 粒のざわつき（grainFpsで更新）
+  const pn=performance.now()/1000;
+  gl.uniform1f(glU.uSeed,Math.floor(pn*ART.grainFps)%997+1); // 粒のざわつき（grainFpsで更新）
+  gl.uniform1f(glU.uTime,pn%200);                            // 背景ノイズの切り替え
+  gl.uniform1f(glU.uGlitch,glitchOn?1:0);
+  gl.uniform1f(glU.uGSeed,Math.floor(pn*14)%997+1);          // グリッチ長方形の切り替え（14回/秒）
   gl.uniform3fv(glU.uBlobs,blobArr);
   gl.drawArrays(gl.TRIANGLES,0,3);
 }
@@ -257,7 +313,7 @@ function hashId(id){let h=2166136261;const s=String(id);for(let i=0;i<s.length;i
 
 /* ---------- blobs ---------- */
 let blobs=[], total=0, localSeq=0, displaySeq=0;
-function makeBlob(rec){ // rec: {id, cid, x(0..1), y(0..1), r(px)}
+function makeBlob(rec,opt){ // rec: {id, cid, x(0..1), y(0..1), r(px)} / opt: {num, front}（飛散からの復帰用）
   const rng=mulberry32(hashId(rec.id));
   const b={
     id:rec.id, cid:rec.cid||null,
@@ -266,13 +322,14 @@ function makeBlob(rec){ // rec: {id, cid, x(0..1), y(0..1), r(px)}
     p1:rng()*6.283, p2:rng()*6.283, p3:rng()*6.283, pf:0.5+rng(),
     x:0,y:0,r:rec.r, own:rec.cid===myId,
   };
-  b.num=displaySeq++;
+  b.num=(opt&&opt.num!=null)?opt.num:displaySeq++;
   b.rec=rec;
   if(!HAS_GL){b.cEl=document.createElementNS(SVGNS,'circle');gooG.appendChild(b.cEl)}
   b.hEl=document.createElementNS(SVGNS,'g');
   b.hEl.innerHTML=`<path fill="none"/><circle r="1.6"/><rect rx="1"/><text font-family="Consolas,Menlo,monospace"></text>`;
   hudG.appendChild(b.hEl);
-  blobs.push(b);
+  if(opt&&opt.front){blobs.unshift(b);hudG.insertBefore(b.hEl,hudG.firstChild)}
+  else blobs.push(b);
   while(blobs.length>MAX)removeBlob(blobs[0]);
   return b;
 }
@@ -322,6 +379,93 @@ function posAt(b,t){
   b.r=b.r0*(1+P.pulse*0.25*Math.sin(t*b.pf+b.p2));
 }
 
+/* ============================================================
+ * 盛り上がり → クライマックス → 飛散
+ *   ・密集度（シェーダーと同じ式）をblob座標で評価し、hotMin以上＝オレンジ箇所のblobを hotBlobs とする
+ *   ・hotBlobs が climax.minBlobs 個以上の状態が holdSec 続くとクライマックス（durationSec）
+ *   ・終了時、最新 keep 件以外のblobは四方八方へ飛び散り、hideSec のあいだ画面から消える
+ * ============================================================ */
+let hotBlobs=[], hotSince=0, glitchOn=false, glitchUntil=0, lastClimaxEnd=-1e9, hidden=[], hideUntil=0;
+const root=document.getElementById('root');
+
+/* 飛散アニメ: b.fly={t0,dx,dy,dist,dur,out}。out=飛び去る / !out=戻ってくる（どちらも初速が速いease-out） */
+function flyAll(now){
+  const done=[];
+  for(const b of blobs){
+    const f=b.fly;if(!f)continue;
+    const p=Math.min((now-f.t0)/f.dur,1), e=1-Math.pow(1-p,3), k=f.out?e:1-e;
+    b.x+=f.dx*f.dist*k;b.y+=f.dy*f.dist*k;
+    if(p>=1){if(f.out)done.push(b);else b.fly=null}
+  }
+  for(const b of done){hidden.push({rec:b.rec,num:b.num,dx:b.fly.dx,dy:b.fly.dy});removeBlob(b)}
+}
+function scatterDir(b){
+  const a=Math.atan2(b.y-P.h/2,b.x-P.w/2)+(Math.random()-0.5)*1.2;
+  return [Math.cos(a),Math.sin(a)];
+}
+function restoreHidden(now){
+  const slots=Math.max(MAX-blobs.length,0);
+  const back=slots?hidden.slice(-slots):[];
+  hidden=[];
+  for(let i=back.length-1;i>=0;i--){   // 古い順に先頭へ戻す（最新件は末尾のまま）
+    const h=back[i];
+    const b=makeBlob(h.rec,{num:h.num,front:true});
+    b.fly={t0:now,dx:h.dx,dy:h.dy,dist:1600,dur:CLX.scatterSec*1000,out:false};
+  }
+}
+function updateClimax(now){
+  const hr2=ART.hotRadius*ART.hotRadius;
+  hotBlobs=[];
+  for(const a of blobs){
+    if(a.fly)continue;
+    let d=0;
+    for(const b of blobs){if(b.fly)continue;const dx=a.x-b.x,dy=a.y-b.y;d+=Math.exp(-(dx*dx+dy*dy)/hr2)}
+    if(d>=ART.hotMin)hotBlobs.push(a);
+  }
+  if(glitchOn){if(now>=glitchUntil)endClimax(now);return}
+  if(hidden.length&&now>=hideUntil)restoreHidden(now);
+  if(!CLX.on)return;
+  if(hotBlobs.length>=CLX.minBlobs&&now-lastClimaxEnd>CLX.cooldownSec*1000){
+    if(!hotSince)hotSince=now;
+    if(now-hotSince>=CLX.holdSec*1000)startClimax(now);
+  }else hotSince=0;
+}
+let clxTimer=0;
+function startClimax(now){
+  glitchOn=true;glitchUntil=now+CLX.durationSec*1000;hotSince=0;
+  root.classList.add('climax');
+  for(let i=0;i<CLX.letters;i++)placeClimaxLetter(document.createElement('span'));
+  clxTimer=setInterval(()=>{            // 点滅しながら位置・サイズも入れ替わる
+    const els=letG.querySelectorAll('span.clx');
+    els.forEach(el=>{if(Math.random()<0.35)placeClimaxLetter(el)});
+  },160);
+}
+function placeClimaxLetter(s){
+  s.className='clx';
+  s.textContent=LET.chars[Math.floor(Math.random()*LET.chars.length)];
+  s.style.left=(Math.random()*100).toFixed(2)+'%';
+  s.style.top=(Math.random()*100).toFixed(2)+'%';
+  s.style.fontSize=(3+Math.pow(Math.random(),2)*45).toFixed(1)+'vmin';   // 小さい文字多め＋ときどき巨大
+  s.style.fontFamily=LET.font;s.style.fontWeight=LET.weight;
+  s.style.color=CLX.letterColors[Math.floor(Math.random()*CLX.letterColors.length)];
+  s.style.setProperty('--d',(0.06+Math.random()*0.24).toFixed(2)+'s');
+  s.style.setProperty('--dl',(-Math.random()*0.3).toFixed(2)+'s');
+  if(!s.parentNode)letG.appendChild(s);
+}
+function endClimax(now){
+  glitchOn=false;lastClimaxEnd=now;
+  root.classList.remove('climax');
+  clearInterval(clxTimer);
+  letG.querySelectorAll('span.clx').forEach(el=>el.remove());
+  const keep=new Set(blobs.slice(-Math.max(CLX.keep,0)));
+  for(const b of blobs){
+    if(keep.has(b)||b.fly)continue;
+    const [dx,dy]=scatterDir(b);
+    b.fly={t0:now,dx,dy,dist:1600,dur:CLX.scatterSec*1000,out:true};
+  }
+  hideUntil=now+(CLX.scatterSec+CLX.hideSec)*1000;
+}
+
 /* ---------- render ---------- */
 let linePool=[];
 let lastFrame=0;
@@ -337,6 +481,8 @@ function render(now){
   }
   const t=Date.now()/1000;
   for(const b of blobs)posAt(b,t);
+  flyAll(now);
+  updateClimax(now);
   // グーイ本体
   if(HAS_GL)drawGL();
   else for(const b of blobs){
@@ -530,19 +676,41 @@ svg.addEventListener('click',e=>{
  * 同期はしない（各閲覧者のローカル演出）。フェードせずパッと出てパッと消える（コマ送り感） */
 const letG=document.getElementById('letters');
 function rnd(a){return Array.isArray(a)?a[0]+Math.random()*(a[1]-a[0]):+a}
+let nLet=0,nHot=0;
 function spawnLetter(){
-  if(!document.hidden&&letG.children.length<LET.max&&LET.chars.length){
+  if(!document.hidden&&nLet<LET.max&&LET.chars.length){
     const s=document.createElement('span');
     s.textContent=LET.chars[Math.floor(Math.random()*LET.chars.length)];
     s.style.left=(6+Math.random()*88).toFixed(2)+'%';
     s.style.top=(8+Math.random()*76).toFixed(2)+'%';   // 下部HUDバーを避ける
     s.style.color=LET.color;s.style.fontFamily=LET.font;s.style.fontSize=LET.size;s.style.fontWeight=LET.weight;
-    letG.appendChild(s);
-    setTimeout(()=>s.remove(),rnd(LET.life)*1000);
+    letG.appendChild(s);nLet++;
+    setTimeout(()=>{s.remove();nLet--},rnd(LET.life)*1000);
   }
   setTimeout(spawnLetter,rnd(LET.interval)*1000);
 }
 if(LET.on)spawnLetter();
+
+/* 盛り上がり（オレンジ箇所）の文字: hotBlobs の周辺に短い寿命で高速に出る。
+ * オレンジ箇所のblobが多いほど出現間隔が短くなる */
+function spawnHotLetter(){
+  let wait=rnd(HLET.interval);
+  if(!document.hidden&&!glitchOn&&hotBlobs.length&&nHot<HLET.max&&LET.chars.length){
+    const b=hotBlobs[Math.floor(Math.random()*hotBlobs.length)];
+    const s0=vpScale/DPR, R=ART.hotRadius;
+    const lx=b.x+(Math.random()-0.5)*2*R, ly=b.y+(Math.random()-0.5)*2*R;
+    const s=document.createElement('span');
+    s.textContent=LET.chars[Math.floor(Math.random()*LET.chars.length)];
+    s.style.left=(lx*s0+vpOffX/DPR).toFixed(1)+'px';
+    s.style.top=(ly*s0+vpOffY/DPR).toFixed(1)+'px';
+    s.style.color=LET.color;s.style.fontFamily=LET.font;s.style.fontSize=LET.size;s.style.fontWeight=LET.weight;
+    letG.appendChild(s);nHot++;
+    setTimeout(()=>{s.remove();nHot--},rnd(HLET.life)*1000);
+    wait/=1+hotBlobs.length*0.15;
+  }
+  setTimeout(spawnHotLetter,Math.max(wait,0.016)*1000);
+}
+if(LET.on&&HLET.on)spawnHotLetter();
 
 /* ---------- init ---------- */
 if(INIT_BLOBS!==null&&INIT_BLOBS>0)renderMarks(INIT_BLOBS);else addSeeds();
