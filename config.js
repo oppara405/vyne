@@ -63,8 +63,10 @@ window.BLOB_CONFIG = {
     hotMin: 1.5,       // この密集度からオレンジが混ざり始める（≒近くに2〜3個）
     hotMax: 3.2,       // この密集度で完全にオレンジ（≒近くに4個前後）
     hotSpill: 0.2,     // 盛り上がり周辺の背景にも散るオレンジ粒の量（0で無し）
-    bgNoise: 0.1,      // 背景に点在するグレーのドットノイズの比率（0〜1）。ドットの大きさはpixel、切り替え速度はgrainFpsの1/10
+    bgNoise: 0.01,     // 背景に点在するグレーのドットノイズの比率（0〜1）
     noiseColor: null,  // null=背景色の色相から自動生成（青なら #7682B2 付近）。色を直接指定も可
+    noisePixel: 8,     // ノイズのドット1マスの大きさ（論理px）。null=pixelと同じ
+    noiseFps: 0.6,     // ノイズが切り替わる速さ（回/秒）。null=grainFpsの1/10
   },
 
   /* ---- 盛り上がり（オレンジ箇所）に高速で出る文字 ---- */
@@ -78,15 +80,14 @@ window.BLOB_CONFIG = {
   /* ---- クライマックス ----
    * オレンジ箇所のblobが minBlobs 個以上の状態が holdSec 秒続くと発動。
    * durationSec 秒間、画面全体に長方形グリッチ＋青⇔オレンジ反転＋文字の点滅。
-   * 終了後は最新 keep 件だけ残し、ほかは四方八方に飛び散って hideSec 秒後に戻ってくる */
+   * 終了後は最新 keep 件だけ残し、ほかはカットで消え、hideSec 秒後にカットで戻ってくる */
   climax: {
     on: true,
     minBlobs: 15,
     holdSec: 6,
     durationSec: 2,
     keep: 8,
-    scatterSec: 1.2,     // 飛び散る／戻ってくるアニメーションの秒数
-    hideSec: 60,         // 飛び散ったblobが画面に出ない秒数
+    hideSec: 60,         // 消えたblobが画面に出ない秒数
     cooldownSec: 10,     // 次のクライマックスまでの最短間隔（秒）
     letters: 26,         // 点滅する文字の数
     letterColors: ["#ffffff", "#000000"],

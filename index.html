@@ -89,13 +89,13 @@ const ART=Object.assign({
   bg:'hsl(228,83%,44%)',edge:'hsl(200,83%,44%)',core:'hsl(140,83%,44%)',hot:'#E73600',
   pixel:8,steps:4,scatter:0.6,shimmer:0.35,grainFps:10,
   hotRadius:90,hotMin:2.0,hotMax:3.2,hotSpill:0.2,
-  bgNoise:0.2,noiseColor:null,
+  bgNoise:0.2,noiseColor:null,noisePixel:null,noiseFps:null,
 },CFG.art||{});
 /* 盛り上がり（オレンジ箇所）に高速で出る文字 */
 const HLET=Object.assign({on:true,interval:[0.04,0.18],life:[0.15,0.5],max:30},CFG.hotLetters||{});
 /* クライマックス（グリッチ＋反転 → 飛散） */
 const CLX=Object.assign({
-  on:true,minBlobs:10,holdSec:3,durationSec:2,keep:8,scatterSec:1.2,hideSec:30,cooldownSec:10,
+  on:true,minBlobs:10,holdSec:3,durationSec:2,keep:8,hideSec:30,cooldownSec:10,
   letters:26,letterColors:['#ffffff','#000000'],
 },CFG.climax||{});
 const LET=Object.assign({
@@ -159,7 +159,7 @@ uniform float uPix,uSteps,uScatter,uShimmer,uSeed,uHotR,uHotMin,uHotMax,uHotSpil
 uniform int uCount;
 uniform vec3 uBlobs[${HARD_CAP}];
 uniform vec3 uEdge,uCore,uHot,uBg,uNoise;
-uniform float uTime,uNoiseAmt,uNoiseFps,uGlitch,uGSeed;
+uniform float uTime,uNoiseAmt,uNoiseFps,uNoisePix,uGlitch,uGSeed;
 float h21(vec2 p){p=fract(p*vec2(123.34,456.21));p+=dot(p,p+45.32);return fract(p.x*p.y);}
 /* 静的な粒(hs) + コマごとに変わる粒(hd)。shimmerが大きいほどざわつく */
 float grain(vec2 c,float k){
@@ -213,10 +213,11 @@ void main(){
     if(n3<hot)col=H;
   }else if(n3<hot*uHotSpill)col=H;          /* 盛り上がり周辺に散るオレンジの粒 */
   else{
-    /* 背景のグレーノイズ: blobと同じドット(art.pixel)単位で、bgNoiseの比率だけ点在させる。
+    /* 背景のグレーノイズ: art.noisePixel 単位のドットを bgNoise の比率だけ点在させる。
        ドットごとに切り替わるタイミングをずらし、一斉に入れ替わらないようにする */
-    float rs=floor(uTime*uNoiseFps+h21(cell+vec2(11.0,5.0)));
-    if(h21(cell*0.73+vec2(rs*1.37,rs*0.91))<uNoiseAmt)col=uNoise;
+    vec2 nc=floor(l/uNoisePix);
+    float rs=floor(uTime*uNoiseFps+h21(nc+vec2(11.0,5.0)));
+    if(h21(nc*0.73+vec2(rs*1.37,rs*0.91))<uNoiseAmt)col=uNoise;
   }
   if(solid>1.5)col=uHot;else if(solid>0.5)col=uNoise;
   gl_FragColor=vec4(mix(B,col,uOpacity),1.0);
@@ -233,7 +234,7 @@ void main(){
   const aP=gl.getAttribLocation(glProg,'aP');gl.enableVertexAttribArray(aP);gl.vertexAttribPointer(aP,2,gl.FLOAT,false,0,0);
   ['uRes','uOffset','uScale','uMergeK','uThresh','uOpacity','uCount','uBlobs','uEdge','uCore','uHot','uBg',
    'uPix','uSteps','uScatter','uShimmer','uSeed','uHotR','uHotMin','uHotMax','uHotSpill',
-   'uNoise','uTime','uNoiseAmt','uNoiseFps','uGlitch','uGSeed']
+   'uNoise','uTime','uNoiseAmt','uNoiseFps','uNoisePix','uGlitch','uGSeed']
     .forEach(n=>glU[n]=gl.getUniformLocation(glProg,n));
   // 固定uniform
   gl.uniform1f(glU.uMergeK,MERGE_K);
@@ -253,7 +254,9 @@ void main(){
   gl.uniform1f(glU.uHotSpill,ART.hotSpill);
   gl.uniform3fv(glU.uNoise,css2rgb(NOISE_COLOR));
   gl.uniform1f(glU.uNoiseAmt,Math.min(Math.max(ART.bgNoise,0),1));
-  gl.uniform1f(glU.uNoiseFps,Math.max(ART.grainFps,0)/10);  // ノイズの切り替え = grainFps の1/10
+  // ノイズのドットの大きさ / 切り替え速度（未指定なら pixel / grainFps の1/10）
+  gl.uniform1f(glU.uNoisePix,Math.max(ART.noisePixel!=null?ART.noisePixel:ART.pixel,0.5));
+  gl.uniform1f(glU.uNoiseFps,Math.max(ART.noiseFps!=null?ART.noiseFps:ART.grainFps/10,0));
   gl.uniform1f(glU.uGlitch,0);
   return true;
 }
@@ -380,47 +383,30 @@ function posAt(b,t){
  * 盛り上がり → クライマックス → 飛散
  *   ・密集度（シェーダーと同じ式）をblob座標で評価し、hotMin以上＝オレンジ箇所のblobを hotBlobs とする
  *   ・hotBlobs が climax.minBlobs 個以上の状態が holdSec 続くとクライマックス（durationSec）
- *   ・終了時、最新 keep 件以外のblobは四方八方へ飛び散り、hideSec のあいだ画面から消える
+ *   ・終了時、最新 keep 件以外のblobはカットで消え、hideSec 後にカットで戻る（アニメーションなし）
  * ============================================================ */
 let hotBlobs=[], hotSince=0, glitchOn=false, glitchUntil=0, lastClimaxEnd=-1e9, hidden=[], hideUntil=0;
 const root=document.getElementById('root');
 
-/* 飛散アニメ: b.fly={t0,dx,dy,dist,dur,out}。out=飛び去る / !out=戻ってくる（どちらも初速が速いease-out） */
-function flyAll(now){
-  const done=[];
-  for(const b of blobs){
-    const f=b.fly;if(!f)continue;
-    const p=Math.min((now-f.t0)/f.dur,1), e=1-Math.pow(1-p,3), k=f.out?e:1-e;
-    b.x+=f.dx*f.dist*k;b.y+=f.dy*f.dist*k;
-    if(p>=1){if(f.out)done.push(b);else b.fly=null}
-  }
-  for(const b of done){hidden.push({rec:b.rec,num:b.num,dx:b.fly.dx,dy:b.fly.dy});removeBlob(b)}
-}
-function scatterDir(b){
-  const a=Math.atan2(b.y-P.h/2,b.x-P.w/2)+(Math.random()-0.5)*1.2;
-  return [Math.cos(a),Math.sin(a)];
-}
-function restoreHidden(now){
+function restoreHidden(){
   const slots=Math.max(MAX-blobs.length,0);
   const back=slots?hidden.slice(-slots):[];
   hidden=[];
-  for(let i=back.length-1;i>=0;i--){   // 古い順に先頭へ戻す（最新件は末尾のまま）
+  for(let i=back.length-1;i>=0;i--){   // 古い順に先頭へ戻す（最新件は末尾のまま）。元の番号で即座に再表示
     const h=back[i];
-    const b=makeBlob(h.rec,{num:h.num,front:true});
-    b.fly={t0:now,dx:h.dx,dy:h.dy,dist:1600,dur:CLX.scatterSec*1000,out:false};
+    makeBlob(h.rec,{num:h.num,front:true});
   }
 }
 function updateClimax(now){
   const hr2=ART.hotRadius*ART.hotRadius;
   hotBlobs=[];
   for(const a of blobs){
-    if(a.fly)continue;
     let d=0;
-    for(const b of blobs){if(b.fly)continue;const dx=a.x-b.x,dy=a.y-b.y;d+=Math.exp(-(dx*dx+dy*dy)/hr2)}
+    for(const b of blobs){const dx=a.x-b.x,dy=a.y-b.y;d+=Math.exp(-(dx*dx+dy*dy)/hr2)}
     if(d>=ART.hotMin)hotBlobs.push(a);
   }
   if(glitchOn){if(now>=glitchUntil)endClimax(now);return}
-  if(hidden.length&&now>=hideUntil)restoreHidden(now);
+  if(hidden.length&&now>=hideUntil)restoreHidden();
   if(!CLX.on)return;
   if(hotBlobs.length>=CLX.minBlobs&&now-lastClimaxEnd>CLX.cooldownSec*1000){
     if(!hotSince)hotSince=now;
@@ -454,13 +440,9 @@ function endClimax(now){
   root.classList.remove('climax');
   clearInterval(clxTimer);
   letG.querySelectorAll('span.clx').forEach(el=>el.remove());
-  const keep=new Set(blobs.slice(-Math.max(CLX.keep,0)));
-  for(const b of blobs){
-    if(keep.has(b)||b.fly)continue;
-    const [dx,dy]=scatterDir(b);
-    b.fly={t0:now,dx,dy,dist:1600,dur:CLX.scatterSec*1000,out:true};
-  }
-  hideUntil=now+(CLX.scatterSec+CLX.hideSec)*1000;
+  const gone=blobs.slice(0,Math.max(blobs.length-Math.max(CLX.keep,0),0));  // 最新 keep 件以外
+  for(const b of gone){hidden.push({rec:b.rec,num:b.num});removeBlob(b)}
+  hideUntil=now+CLX.hideSec*1000;
 }
 
 /* ---------- render ---------- */
@@ -478,7 +460,6 @@ function render(now){
   }
   const t=Date.now()/1000;
   for(const b of blobs)posAt(b,t);
-  flyAll(now);
   updateClimax(now);
   // グーイ本体
   if(HAS_GL)drawGL();
