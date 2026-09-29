@@ -23,16 +23,16 @@ window.BLOB_CONFIG = {
    *               数値 → Total Marksに関係なく常にその数で表示（上限は maxBlobs / mobileMaxBlobs）
    * Supabase未接続かつ initialBlobs:null のときは seedBlobs を表示 */
   initial: {
-    initialBlobs: null,
+    initialBlobs: 35,
   },
 
   /* ---- フレームレート / モバイル軽量モード ----
    * fps を下げるとコマ送り風（アナログ感）になる。1〜60。60以上は制限なし */
   perf: {
     pcFps: 24,            // PCのフレームレート
-    mobileFps: 24,        // モバイルのフレームレート
+    mobileFps: 18,        // モバイルのフレームレート
     mobileBlurScale: 0.5, // モバイルでのブラー弱体化（0.5〜1）
-    mobileMaxBlobs: 15,   // モバイルでの表示blob上限
+    mobileMaxBlobs: 30,   // モバイルでの表示blob上限
   },
 
   /* ---- 自分のblobのハイライト（テキスト選択風） ---- */
@@ -63,9 +63,8 @@ window.BLOB_CONFIG = {
     hotMin: 1.5,       // この密集度からオレンジが混ざり始める（≒近くに2〜3個）
     hotMax: 3.2,       // この密集度で完全にオレンジ（≒近くに4個前後）
     hotSpill: 0.2,     // 盛り上がり周辺の背景にも散るオレンジ粒の量（0で無し）
-    bgNoise: 0.2,      // 背景に走るグリッチノイズ（グレー）の比率（0〜1）
+    bgNoise: 0.1,      // 背景に点在するグレーのドットノイズの比率（0〜1）。ドットの大きさはpixel、切り替え速度はgrainFpsの1/10
     noiseColor: null,  // null=背景色の色相から自動生成（青なら #7682B2 付近）。色を直接指定も可
-    noiseFps: 8,       // ノイズの横線が切り替わる速さ（回/秒）
   },
 
   /* ---- 盛り上がり（オレンジ箇所）に高速で出る文字 ---- */
@@ -82,12 +81,12 @@ window.BLOB_CONFIG = {
    * 終了後は最新 keep 件だけ残し、ほかは四方八方に飛び散って hideSec 秒後に戻ってくる */
   climax: {
     on: true,
-    minBlobs: 10,
-    holdSec: 3,
+    minBlobs: 15,
+    holdSec: 6,
     durationSec: 2,
     keep: 8,
     scatterSec: 1.2,     // 飛び散る／戻ってくるアニメーションの秒数
-    hideSec: 30,         // 飛び散ったblobが画面に出ない秒数
+    hideSec: 60,         // 飛び散ったblobが画面に出ない秒数
     cooldownSec: 10,     // 次のクライマックスまでの最短間隔（秒）
     letters: 26,         // 点滅する文字の数
     letterColors: ["#ffffff", "#000000"],

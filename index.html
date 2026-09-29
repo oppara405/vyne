@@ -89,7 +89,7 @@ const ART=Object.assign({
   bg:'hsl(228,83%,44%)',edge:'hsl(200,83%,44%)',core:'hsl(140,83%,44%)',hot:'#E73600',
   pixel:8,steps:4,scatter:0.6,shimmer:0.35,grainFps:10,
   hotRadius:90,hotMin:2.0,hotMax:3.2,hotSpill:0.2,
-  bgNoise:0.2,noiseColor:null,noiseFps:8,
+  bgNoise:0.2,noiseColor:null,
 },CFG.art||{});
 /* 盛り上がり（オレンジ箇所）に高速で出る文字 */
 const HLET=Object.assign({on:true,interval:[0.04,0.18],life:[0.15,0.5],max:30},CFG.hotLetters||{});
@@ -213,13 +213,10 @@ void main(){
     if(n3<hot)col=H;
   }else if(n3<hot*uHotSpill)col=H;          /* 盛り上がり周辺に散るオレンジの粒 */
   else{
-    /* 背景のグリッチノイズ: 2ドット高の横帯ごとに、長さの違う横線がランダムに走る。
-       帯ごとに切り替わるタイミングをずらし、ビデオノイズのようにちらつかせる */
-    float row=floor(cell.y/2.0);
-    float rs=floor(uTime*uNoiseFps+h21(vec2(row,11.0))*4.0);
-    float segLen=3.0+floor(h21(vec2(row,rs+7.0))*30.0);
-    float seg=floor((cell.x+h21(vec2(row,rs+3.0))*64.0)/segLen);
-    if(h21(vec2(seg,row+rs*0.37))<uNoiseAmt)col=uNoise;
+    /* 背景のグレーノイズ: blobと同じドット(art.pixel)単位で、bgNoiseの比率だけ点在させる。
+       ドットごとに切り替わるタイミングをずらし、一斉に入れ替わらないようにする */
+    float rs=floor(uTime*uNoiseFps+h21(cell+vec2(11.0,5.0)));
+    if(h21(cell*0.73+vec2(rs*1.37,rs*0.91))<uNoiseAmt)col=uNoise;
   }
   if(solid>1.5)col=uHot;else if(solid>0.5)col=uNoise;
   gl_FragColor=vec4(mix(B,col,uOpacity),1.0);
@@ -256,7 +253,7 @@ void main(){
   gl.uniform1f(glU.uHotSpill,ART.hotSpill);
   gl.uniform3fv(glU.uNoise,css2rgb(NOISE_COLOR));
   gl.uniform1f(glU.uNoiseAmt,Math.min(Math.max(ART.bgNoise,0),1));
-  gl.uniform1f(glU.uNoiseFps,Math.max(ART.noiseFps,0));
+  gl.uniform1f(glU.uNoiseFps,Math.max(ART.grainFps,0)/10);  // ノイズの切り替え = grainFps の1/10
   gl.uniform1f(glU.uGlitch,0);
   return true;
 }
