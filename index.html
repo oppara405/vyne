@@ -3,14 +3,18 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Blob Network v4.1 — WebGL Edition</title>
+<title>Blob Network v4.1 — Low-bit / Sand Edition</title>
 <style>
   html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:transparent;}
   #root{position:relative;width:100%;height:100%;}
   #goo{position:absolute;inset:0;width:100%;height:100%;display:block;}
   svg{position:absolute;inset:0;width:100%;height:100%;display:block;cursor:crosshair;}
   svg.used{cursor:default;}
+  #letters{position:absolute;inset:0;overflow:hidden;pointer-events:none;}
+  #letters span{position:absolute;transform:translate(-50%,-50%);line-height:1;white-space:pre;}
 </style>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Open+Sans:wght@400&display=swap" rel="stylesheet">
 
 <!-- ============================================================
      HUDバーのスタイル（★カスタマイズはこのブロックを編集★）
@@ -48,6 +52,7 @@
 <body>
 <div id="root">
   <canvas id="goo"></canvas><!-- グーイ描画: WebGL(GPU) -->
+  <div id="letters"></div><!-- 別レイヤー: V/Y/N/E のランダム文字 -->
   <svg id="svg" xmlns="http://www.w3.org/2000/svg" preserveAspectRatio="xMidYMid slice"></svg><!-- 線+HUD: フィルター無しSVG(軽量) -->
   <div id="bar" style="display:none">
     <div class="txt" id="barL"></div>
@@ -60,23 +65,33 @@
 <script>
 "use strict";
 /* ============================================================
- * BLOB NETWORK v4.1 — 埋め込みウィジェット本体（WebGL Edition）
+ * BLOB NETWORK v4.1 — LOW-BIT / SAND Edition
  *
- * v4からの見た目修正:
- *   ・メタボール場を 1/d² 型 → 有限半径カーネル (1-(d/R)²)² に変更
- *     - 遠方に裾を引かないため、blobが多くても画面全体が薄く発色しない
- *   ・エッジをピクセル精度でAA（fwidth）→ 旧SVG版のシャープな輪郭を再現
- *   ・グラデーションを「blobごとの局所座標」で計算
- *     - 旧SVG版（objectBoundingBox基準＝blob単位のグラデ）の見た目を再現
- *     - 融合部は場の寄与率で色を加重ブレンド
+ * WebGL版をベースに、blobの「描き方」だけを差し替えたアートディレクション版。
+ * 座標・接続線・HUD・クリック/同期ロジックは main と同一。
+ *   ・論理座標に固定した粗いドットグリッド（art.pixel）で場を評価 → ロービット
+ *   ・輪郭はディザで外側へ砂粒のように散らす（art.scatter）
+ *   ・粒はコマごとに少しざわつく（art.shimmer / art.grainFps）
+ *   ・色: 背景=青 / blob輪郭=青寄り → 中心=緑（段階量子化＋ディザ）
+ *   ・盛り上がり: blob座標が密集した場所がキーカラー(オレンジ)に変化（art.hot*）
+ *   ・別レイヤー: V/Y/N/E の文字がランダムな位置に現れては消える（letters）
  * ============================================================ */
 const CFG=window.BLOB_CONFIG||{};
 const P=Object.assign({
-  w:1200,h:700,bg:'#ffffff',c1:'#d9e92c',c2:'#4fc3e8',useGrad:false,gradAng:45,
+  w:1200,h:700,
   blur:14,contrast:28,opacity:1,minR:14,maxR:80,speed:50,pulse:0.3,
   lnOn:true,lnDist:320,lnW:1.5,lnC:'#1c1e22',lnA:0.7,
   hudMarker:true,hudCoords:true,hudId:true,hudSize:11,hudC:'#1c1e22',
 },CFG.params||{});
+const ART=Object.assign({
+  bg:'hsl(228,83%,44%)',edge:'hsl(200,83%,44%)',core:'hsl(140,83%,44%)',hot:'#E73600',
+  pixel:8,steps:4,scatter:0.6,shimmer:0.35,grainFps:10,
+  hotRadius:90,hotMin:2.0,hotMax:3.2,hotSpill:0.2,
+},CFG.art||{});
+const LET=Object.assign({
+  on:true,chars:'VYNE',color:'#000000',font:'"Open Sans","Helvetica Neue",Arial,sans-serif',
+  size:'clamp(28px,4.2vw,64px)',weight:400,interval:[0.6,2.0],life:[1.2,3.5],max:6,
+},CFG.letters||{});
 const SEL=Object.assign({bg:'#000000',text:'#ffffff'},CFG.selection||{});
 const IS_MOBILE=(window.matchMedia&&matchMedia('(pointer:coarse)').matches)||/iPhone|iPad|Android/i.test(navigator.userAgent);
 const PERF=Object.assign({pcFps:60,mobileFps:60,mobileBlurScale:1,mobileMaxBlobs:50},CFG.perf||{});
@@ -103,8 +118,10 @@ const DPR=Math.min(window.devicePixelRatio||1,2);
 /* メタボールは有限半径カーネル (1-(d/R)^2)^2 を使用。R = r × MERGE_K が影響半径 */
 const MERGE_K=1.6+P.blur/25;                                   // blur → 融合の届く距離
 const THRESH=Math.pow(1-1/(MERGE_K*MERGE_K),2);                // 単独blobの輪郭がちょうど半径rになるしきい値
-const SOFT=Math.min(Math.max(6/P.contrast,0.02),0.3);          // contrast → エッジの柔らかさ（最小値として作用）
-function hex2rgb(h){const n=parseInt(h.slice(1),16);return[(n>>16&255)/255,(n>>8&255)/255,(n&255)/255]}
+/* CSS色（#hex / hsl() / 色名）→ [r,g,b] 0..1 */
+const _cx=document.createElement('canvas').getContext('2d');
+function css2hex(c){_cx.fillStyle='#000';_cx.fillStyle=c;return _cx.fillStyle}
+function css2rgb(c){const n=parseInt(css2hex(c).slice(1),16);return[(n>>16&255)/255,(n>>8&255)/255,(n&255)/255]}
 
 function initGL(){
   try{
@@ -112,46 +129,53 @@ function initGL(){
       ||canvas.getContext('experimental-webgl');
   }catch(e){gl=null}
   if(!gl){console.warn('[blob] WebGL利用不可 → SVGフォールバック描画');return false}
-  const hasDeriv=!!gl.getExtension('OES_standard_derivatives'); // ピクセル精度のエッジAA用
   const vs=`attribute vec2 aP;void main(){gl_Position=vec4(aP,0.,1.);}`;
-  const fs=(hasDeriv?'#extension GL_OES_standard_derivatives : enable\n':'')
-+`#ifdef GL_FRAGMENT_PRECISION_HIGH
+  const fs=`#ifdef GL_FRAGMENT_PRECISION_HIGH
 precision highp float;
 #else
 precision mediump float;
 #endif
-uniform vec2 uRes,uOffset,uGradDir;
-uniform float uScale,uSoft,uMergeK,uThresh,uOpacity;
+uniform vec2 uRes,uOffset;
+uniform float uScale,uMergeK,uThresh,uOpacity;
+uniform float uPix,uSteps,uScatter,uShimmer,uSeed,uHotR,uHotMin,uHotMax,uHotSpill;
 uniform int uCount;
 uniform vec3 uBlobs[${HARD_CAP}];
-uniform vec3 uC1,uC2,uBg;
+uniform vec3 uEdge,uCore,uHot,uBg;
+float h21(vec2 p){p=fract(p*vec2(123.34,456.21));p+=dot(p,p+45.32);return fract(p.x*p.y);}
+/* 静的な粒(hs) + コマごとに変わる粒(hd)。shimmerが大きいほどざわつく */
+float grain(vec2 c,float k){
+  return fract(h21(c*k+k*3.1)+uShimmer*h21(c*(k*0.7+0.3)+uSeed*k));
+}
 void main(){
   vec2 frag=vec2(gl_FragCoord.x,uRes.y-gl_FragCoord.y);
   vec2 l=(frag-uOffset)/uScale;              /* 論理座標(1200x700系)へ変換 */
-  float f=0.0;
-  vec3 cg=vec3(0.0);
+  vec2 cell=floor(l/uPix);                   /* 論理座標に固定した粗いドット */
+  vec2 c=(cell+0.5)*uPix;
+  float f=0.0,m=0.0,dens=0.0,hr2=uHotR*uHotR;
   for(int i=0;i<${HARD_CAP};i++){
     if(i>=uCount)break;
-    vec2 d=l-uBlobs[i].xy;
-    float r=uBlobs[i].z;
-    float R=r*uMergeK;
-    float q=dot(d,d)/(R*R);
-    if(q<1.0){
-      float w=1.0-q; w*=w;                   /* 有限半径カーネル: 遠方はゼロ */
-      f+=w;
-      /* blobごとの局所グラデーション（旧SVG版のobjectBoundingBox挙動を再現）
-         融合部は場の寄与で加重ブレンド */
-      float ti=clamp(dot(d/(2.0*r),uGradDir)+0.5,0.0,1.0);
-      cg+=w*mix(uC1,uC2,ti);
-    }
+    vec2 d=c-uBlobs[i].xy;
+    float dd=dot(d,d);
+    float R=uBlobs[i].z*uMergeK;
+    float q=dd/(R*R);
+    if(q<1.0){float w=1.0-q;w*=w;f+=w;m=max(m,w);} /* メタボール場（有限半径カーネル）/ m=最寄りblob中心への近さ */
+    dens+=exp(-dd/hr2);                      /* 座標の密集度（盛り上がり判定） */
   }
-  ${hasDeriv
-    ?'float aa=max(fwidth(f)*1.2,uSoft*0.15);'   /* 画面上ほぼ1pxのシャープな輪郭 */
-    :'float aa=uSoft;'}
-  float a=smoothstep(uThresh-aa,uThresh+aa,f)*uOpacity;
-  vec3 grad=f>0.0?cg/f:uC1;
-  vec3 col=mix(uBg,grad,a);
-  gl_FragColor=vec4(col,1.0);
+  float n1=grain(cell,1.0),n2=grain(cell,1.7),n3=grain(cell,2.3);
+  float v=f/uThresh;                         /* 1.0 = blob輪郭 */
+  /* 粒の出現確率: 輪郭(v=1)の内側は必ず埋まり、外側は裾を引いてまばらになる（砂）。
+     scatterが大きいほど裾が長い（v^(1/(0.7*scatter))） */
+  float p=v>=1.0?1.0:pow(v,1.0/(0.7*uScatter));
+  float hot=smoothstep(uHotMin,uHotMax,dens);
+  vec3 col=uBg;
+  if(n1<p){
+    float t=smoothstep(0.15,0.95,m);                   /* 各blobの出現位置(中心)=緑 → 外側=青。融合部でも中心だけ緑 */
+    t+=(grain(cell,3.1)-0.5)*0.35;                     /* 粒ごとの色ゆらぎ（砂の混色感） */
+    float tq=clamp(floor(t*uSteps+n2)/uSteps,0.0,1.0);  /* 階調を量子化＋ディザ */
+    col=mix(uEdge,uCore,tq);
+    if(n3<hot)col=uHot;
+  }else if(n3<hot*uHotSpill)col=uHot;       /* 盛り上がり周辺に散るオレンジの粒 */
+  gl_FragColor=vec4(mix(uBg,col,uOpacity),1.0);
 }`;
   function sh(type,src){const s=gl.createShader(type);gl.shaderSource(s,src);gl.compileShader(s);
     if(!gl.getShaderParameter(s,gl.COMPILE_STATUS)){console.warn('[blob] shader error:',gl.getShaderInfoLog(s));return null}return s}
@@ -163,18 +187,25 @@ void main(){
   const buf=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,buf);
   gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,3,-1,-1,3]),gl.STATIC_DRAW);
   const aP=gl.getAttribLocation(glProg,'aP');gl.enableVertexAttribArray(aP);gl.vertexAttribPointer(aP,2,gl.FLOAT,false,0,0);
-  ['uRes','uOffset','uGradDir','uScale','uSoft','uMergeK','uThresh','uOpacity','uCount','uBlobs','uC1','uC2','uBg']
+  ['uRes','uOffset','uScale','uMergeK','uThresh','uOpacity','uCount','uBlobs','uEdge','uCore','uHot','uBg',
+   'uPix','uSteps','uScatter','uShimmer','uSeed','uHotR','uHotMin','uHotMax','uHotSpill']
     .forEach(n=>glU[n]=gl.getUniformLocation(glProg,n));
   // 固定uniform
-  const ga=P.gradAng*Math.PI/180;
-  gl.uniform2f(glU.uGradDir,Math.cos(ga),Math.sin(ga));
-  gl.uniform1f(glU.uSoft,SOFT);
   gl.uniform1f(glU.uMergeK,MERGE_K);
   gl.uniform1f(glU.uThresh,THRESH);
   gl.uniform1f(glU.uOpacity,P.opacity);
-  gl.uniform3fv(glU.uC1,hex2rgb(P.c1));
-  gl.uniform3fv(glU.uC2,hex2rgb(P.useGrad?P.c2:P.c1)); // 単色時はc1=c2
-  gl.uniform3fv(glU.uBg,hex2rgb(P.bg));
+  gl.uniform3fv(glU.uEdge,css2rgb(ART.edge));
+  gl.uniform3fv(glU.uCore,css2rgb(ART.core));
+  gl.uniform3fv(glU.uHot,css2rgb(ART.hot));
+  gl.uniform3fv(glU.uBg,css2rgb(ART.bg));
+  gl.uniform1f(glU.uPix,Math.max(ART.pixel,1));
+  gl.uniform1f(glU.uSteps,Math.max(ART.steps,1));
+  gl.uniform1f(glU.uScatter,Math.min(Math.max(ART.scatter,0.01),0.99));
+  gl.uniform1f(glU.uShimmer,ART.shimmer);
+  gl.uniform1f(glU.uHotR,Math.max(ART.hotRadius,1));
+  gl.uniform1f(glU.uHotMin,ART.hotMin);
+  gl.uniform1f(glU.uHotMax,Math.max(ART.hotMax,ART.hotMin+0.01));
+  gl.uniform1f(glU.uHotSpill,ART.hotSpill);
   return true;
 }
 let vpScale=1,vpOffX=0,vpOffY=0;
@@ -201,6 +232,7 @@ function drawGL(){
     blobArr[i*3]=b.x;blobArr[i*3+1]=b.y;blobArr[i*3+2]=b.r;
   }
   gl.uniform1i(glU.uCount,blobs.length);
+  gl.uniform1f(glU.uSeed,Math.floor(performance.now()/1000*ART.grainFps)%997+1); // 粒のざわつき（grainFpsで更新）
   gl.uniform3fv(glU.uBlobs,blobArr);
   gl.drawArrays(gl.TRIANGLES,0,3);
 }
@@ -210,10 +242,10 @@ svg.setAttribute('viewBox',`0 0 ${P.w} ${P.h}`);
 HAS_GL=initGL();
 console.info('[blob] renderer:',HAS_GL?'WebGL (GPU)':'SVG fallback');
 svg.innerHTML=
-  (HAS_GL?'':`<rect width="${P.w}" height="${P.h}" fill="${P.bg}"/>`
-    +`<defs><linearGradient id="grad" x1="0%" y1="0%" x2="100%" y2="0%">`
-    +`<stop offset="0%" stop-color="${P.c1}"/><stop offset="100%" stop-color="${P.useGrad?P.c2:P.c1}"/></linearGradient></defs>`
-    +`<g id="goog" fill="${P.useGrad?'url(#grad)':P.c1}" opacity="${P.opacity}"></g>`)
+  (HAS_GL?'':`<rect width="${P.w}" height="${P.h}" fill="${css2hex(ART.bg)}"/>`
+    +`<defs><radialGradient id="grad"><stop offset="0%" stop-color="${css2hex(ART.core)}"/>`
+    +`<stop offset="100%" stop-color="${css2hex(ART.edge)}"/></radialGradient></defs>`
+    +`<g id="goog" fill="url(#grad)" opacity="${P.opacity}"></g>`)
   +`<g id="lineg"></g><g id="hudg"></g>`;
 const gooG=svg.querySelector('#goog'), lineG=svg.querySelector('#lineg'), hudG=svg.querySelector('#hudg');
 resizeGL();
@@ -493,6 +525,24 @@ svg.addEventListener('click',e=>{
     });
   }
 });
+
+/* ---------- 別レイヤー: V/Y/N/E のランダム文字 ----------
+ * 同期はしない（各閲覧者のローカル演出）。フェードせずパッと出てパッと消える（コマ送り感） */
+const letG=document.getElementById('letters');
+function rnd(a){return Array.isArray(a)?a[0]+Math.random()*(a[1]-a[0]):+a}
+function spawnLetter(){
+  if(!document.hidden&&letG.children.length<LET.max&&LET.chars.length){
+    const s=document.createElement('span');
+    s.textContent=LET.chars[Math.floor(Math.random()*LET.chars.length)];
+    s.style.left=(6+Math.random()*88).toFixed(2)+'%';
+    s.style.top=(8+Math.random()*76).toFixed(2)+'%';   // 下部HUDバーを避ける
+    s.style.color=LET.color;s.style.fontFamily=LET.font;s.style.fontSize=LET.size;s.style.fontWeight=LET.weight;
+    letG.appendChild(s);
+    setTimeout(()=>s.remove(),rnd(LET.life)*1000);
+  }
+  setTimeout(spawnLetter,rnd(LET.interval)*1000);
+}
+if(LET.on)spawnLetter();
 
 /* ---------- init ---------- */
 if(INIT_BLOBS!==null&&INIT_BLOBS>0)renderMarks(INIT_BLOBS);else addSeeds();
