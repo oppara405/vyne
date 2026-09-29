@@ -89,13 +89,13 @@ const ART=Object.assign({
   bg:'hsl(228,83%,44%)',edge:'hsl(200,83%,44%)',core:'hsl(140,83%,44%)',hot:'#E73600',
   pixel:8,steps:4,scatter:0.6,shimmer:0.35,grainFps:10,
   hotRadius:90,hotMin:2.0,hotMax:3.2,hotSpill:0.2,
-  bgNoise:0.2,noiseColor:null,noisePixel:null,noiseFps:null,
+  bgNoise:0.2,noiseColor:null,noisePixel:null,noiseFps:null,bgShape:0,noiseLineLen:[3,20],
 },CFG.art||{});
 /* 盛り上がり（オレンジ箇所）に高速で出る文字 */
 const HLET=Object.assign({on:true,interval:[0.04,0.18],life:[0.15,0.5],max:30},CFG.hotLetters||{});
 /* クライマックス（グリッチ＋反転 → 飛散） */
 const CLX=Object.assign({
-  on:true,minBlobs:10,holdSec:3,durationSec:2,keep:8,hideSec:30,cooldownSec:10,
+  on:true,requireClick:true,minBlobs:10,holdSec:3,durationSec:2,keep:8,hideSec:30,cooldownSec:10,
   letters:26,letterColors:['#ffffff','#000000'],
 },CFG.climax||{});
 const LET=Object.assign({
@@ -159,7 +159,8 @@ uniform float uPix,uSteps,uScatter,uShimmer,uSeed,uHotR,uHotMin,uHotMax,uHotSpil
 uniform int uCount;
 uniform vec3 uBlobs[${HARD_CAP}];
 uniform vec3 uEdge,uCore,uHot,uBg,uNoise;
-uniform float uTime,uNoiseAmt,uNoiseFps,uNoisePix,uGlitch,uGSeed;
+uniform float uTime,uNoiseAmt,uNoiseFps,uNoisePix,uNoiseShape,uGlitch,uGSeed;
+uniform vec2 uNoiseLen;
 float h21(vec2 p){p=fract(p*vec2(123.34,456.21));p+=dot(p,p+45.32);return fract(p.x*p.y);}
 /* 静的な粒(hs) + コマごとに変わる粒(hd)。shimmerが大きいほどざわつく */
 float grain(vec2 c,float k){
@@ -216,8 +217,19 @@ void main(){
     /* 背景のグレーノイズ: art.noisePixel 単位のドットを bgNoise の比率だけ点在させる。
        ドットごとに切り替わるタイミングをずらし、一斉に入れ替わらないようにする */
     vec2 nc=floor(l/uNoisePix);
-    float rs=floor(uTime*uNoiseFps+h21(nc+vec2(11.0,5.0)));
-    if(h21(nc*0.73+vec2(rs*1.37,rs*0.91))<uNoiseAmt)col=uNoise;
+    if(uNoiseShape<0.5){
+      /* 0: 正方形のドット */
+      float rs=floor(uTime*uNoiseFps+h21(nc+vec2(11.0,5.0)));
+      if(h21(nc*0.73+vec2(rs*1.37,rs*0.91))<uNoiseAmt)col=uNoise;
+    }else{
+      /* 1: 横線（1ドット高の長方形）。行ごとに長さ uNoiseLen(最小〜最大ドット) の線が並び、
+         行ごとにずれたタイミングで入れ替わる */
+      float row=nc.y;
+      float rs=floor(uTime*uNoiseFps+h21(vec2(row,11.0)));
+      float segLen=uNoiseLen.x+floor(h21(vec2(row,rs+7.0))*(uNoiseLen.y-uNoiseLen.x+1.0));
+      float seg=floor((nc.x+h21(vec2(row,rs+3.0))*64.0)/segLen);
+      if(h21(vec2(seg*0.73,row+rs*0.37))<uNoiseAmt)col=uNoise;
+    }
   }
   if(solid>1.5)col=uHot;else if(solid>0.5)col=uNoise;
   gl_FragColor=vec4(mix(B,col,uOpacity),1.0);
@@ -234,7 +246,7 @@ void main(){
   const aP=gl.getAttribLocation(glProg,'aP');gl.enableVertexAttribArray(aP);gl.vertexAttribPointer(aP,2,gl.FLOAT,false,0,0);
   ['uRes','uOffset','uScale','uMergeK','uThresh','uOpacity','uCount','uBlobs','uEdge','uCore','uHot','uBg',
    'uPix','uSteps','uScatter','uShimmer','uSeed','uHotR','uHotMin','uHotMax','uHotSpill',
-   'uNoise','uTime','uNoiseAmt','uNoiseFps','uNoisePix','uGlitch','uGSeed']
+   'uNoise','uTime','uNoiseAmt','uNoiseFps','uNoisePix','uNoiseShape','uNoiseLen','uGlitch','uGSeed']
     .forEach(n=>glU[n]=gl.getUniformLocation(glProg,n));
   // 固定uniform
   gl.uniform1f(glU.uMergeK,MERGE_K);
@@ -256,6 +268,9 @@ void main(){
   gl.uniform1f(glU.uNoiseAmt,Math.min(Math.max(ART.bgNoise,0),1));
   // ノイズのドットの大きさ / 切り替え速度（未指定なら pixel / grainFps の1/10）
   gl.uniform1f(glU.uNoisePix,Math.max(ART.noisePixel!=null?ART.noisePixel:ART.pixel,0.5));
+  gl.uniform1f(glU.uNoiseShape,ART.bgShape?1:0);   // 0=正方形 / 1=横線
+  const nl=Array.isArray(ART.noiseLineLen)?ART.noiseLineLen:[ART.noiseLineLen,ART.noiseLineLen];
+  gl.uniform2f(glU.uNoiseLen,Math.max(Math.round(nl[0]),1),Math.max(Math.round(nl[1]),Math.round(nl[0]),1));
   gl.uniform1f(glU.uNoiseFps,Math.max(ART.noiseFps!=null?ART.noiseFps:ART.grainFps/10,0));
   gl.uniform1f(glU.uGlitch,0);
   return true;
@@ -408,6 +423,7 @@ function updateClimax(now){
   if(glitchOn){if(now>=glitchUntil)endClimax(now);return}
   if(hidden.length&&now>=hideUntil)restoreHidden();
   if(!CLX.on)return;
+  if(CLX.requireClick&&!clicksUsed){hotSince=0;return}  // 自分がクリックして自分のblobが出るまでは発動しない
   if(hotBlobs.length>=CLX.minBlobs&&now-lastClimaxEnd>CLX.cooldownSec*1000){
     if(!hotSince)hotSince=now;
     if(now-hotSince>=CLX.holdSec*1000)startClimax(now);
