@@ -358,6 +358,10 @@ function driftAt(b,t){
           A*(Math.cos(T*b.f2+b.p2)+0.6*Math.cos(T*b.f1*1.3+b.p1*1.7))];
 }
 
+/* ラベル番号: k番目（0起点）の印を、HUDバーの Total Marks 表示と同じ基準で表す。
+ * countOffset:-1 なら 0起点（最新 = Total Marks 表示と同じ数字）、0 なら 1起点 */
+function labelNum(k){return k+1+COUNT_OFFSET}
+
 /* seed blobs（Supabase未接続時・Total Marks=0のときのフォールバック表示） */
 function addSeeds(){(CFG.seedBlobs||[]).forEach((s,i)=>makeBlob({id:'seed'+i,cid:null,x:s.x,y:s.y,r:s.r}))}
 
@@ -372,7 +376,7 @@ function renderMarks(n){
   const count=Math.min(Number(n)||0,MAX);
   if(count<=0)return;
   marksRendered=true;
-  const own=blobs.filter(b=>b.own).map(b=>b.rec);
+  const own=blobs.filter(b=>b.own).map(b=>({rec:b.rec,num:b.num}));
   clearBlobs();
   for(let i=0;i<count;i++){
     const k=n-count+i;
@@ -380,9 +384,9 @@ function renderMarks(n){
     makeBlob({id:'mark'+k,cid:null,
       x:+(0.08+rng()*0.84).toFixed(4),
       y:+(0.08+rng()*0.84).toFixed(4),
-      r:Math.round(P.minR+(P.maxR-P.minR)*rng())});
+      r:Math.round(P.minR+(P.maxR-P.minR)*rng())},{num:labelNum(k)});
   }
-  own.forEach(rec=>makeBlob(rec));
+  own.forEach(o=>makeBlob(o.rec,{num:o.num}));
 }
 
 /* ---------- 物理（時刻の純関数） ---------- */
@@ -593,7 +597,7 @@ function initSupabase(){
         const now=Date.now(), cid=String(p.cid||'?');
         if(now-(rxLast.get(cid)||0)<250)return;
         rxLast.set(cid,now);
-        makeBlob({id:p.id,cid:p.cid,x:p.x,y:p.y,r:p.r});
+        makeBlob({id:p.id,cid:p.cid,x:p.x,y:p.y,r:p.r},{num:labelNum(total)});
         total++;updateHud();
       }catch(e){console.warn('[blob] broadcast受信処理エラー',e)}
     });
@@ -642,7 +646,7 @@ svg.addEventListener('click',e=>{
   };
   clicksUsed++;
   if(CLICK_LIMIT&&clicksUsed>=CLICK_LIMIT)svg.classList.add('used');
-  makeBlob(rec);
+  makeBlob(rec,{num:labelNum(total)});   // 仮の番号（ローカルの累計から）
   total++;updateHud();
   if(live&&channel){
     try{
@@ -657,6 +661,8 @@ svg.addEventListener('click',e=>{
       const c=Number(data);
       if(isFinite(c)&&c>0){
         total=Math.max(total,c);
+        const mine=blobs.find(x=>x.id===rec.id);   // renderMarksで作り直されていても id で探す
+        if(mine)mine.num=labelNum(c-1);            // DBで確定した通し番号に補正（自分はc番目の印）
         if(!marksRendered)renderMarks(Math.max(total-1,0));
         updateHud();
       }
