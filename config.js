@@ -23,7 +23,7 @@ window.BLOB_CONFIG = {
    *               数値 → Total Marksに関係なく常にその数で表示（上限は maxBlobs / mobileMaxBlobs）
    * Supabase未接続かつ initialBlobs:null のときは seedBlobs を表示 */
   initial: {
-    initialBlobs: 35,
+    initialBlobs: null,
   },
 
   /* ---- フレームレート / モバイル軽量モード ----
@@ -61,7 +61,7 @@ window.BLOB_CONFIG = {
     grainFps: 6,      // 粒がざわつく速さ（回/秒）
     hotRadius: 90,     // 密集判定の半径（論理px）
     hotMin: 1.5,       // この密集度からオレンジが混ざり始める（≒近くに2〜3個）
-    hotMax: 3.2,       // この密集度で完全にオレンジ（≒近くに4個前後）
+    hotMax: 4,       // この密集度で完全にオレンジ（≒近くに4個前後）
     hotSpill: 0.2,     // 盛り上がり周辺の背景にも散るオレンジ粒の量（0で無し）
     bgNoise: 0.04,     // 背景に点在するグレーのドットノイズの比率（0〜1）
     noiseColor: "#4b588b",  // null=背景色の色相から自動生成（青なら #7682B2 付近）。色を直接指定も可
